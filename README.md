@@ -87,7 +87,10 @@ cmake --build build -j
 
 A `flake.nix` is provided. Because Qwen-Image support only exists on
 `openvino.genai` master, which tracks OpenVINO master, the flake builds both
-OpenVINO and openvino-genai from their master branches:
+OpenVINO and openvino-genai from their master branches. `openvino-tokenizers`
+(master) is built alongside so the tokenizer plugin's ABI matches the master
+runtime (`libopenvino.so.2650`) — the nixpkgs package targets 2026.2.x
+(`libopenvino.so.2620`) and fails to dlopen against it:
 
 ```sh
 nix build .#default              # builds the openvino-server binary

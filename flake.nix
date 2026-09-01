@@ -50,14 +50,23 @@
           hash = "sha256-PZlhoj8EZ0S1+rhg5RD3llP+uRfoy0+c1RetIOJINEE=";
         };
       };
+
+      # openvino-tokenizers master, built against the same master OpenVINO so
+      # its ABI matches (libopenvino.so.2650). The nixpkgs package ships
+      # 2026.2.x which targets libopenvino.so.2620 and would fail to dlopen at
+      # runtime on the 2026.5.0 stack.
+      openvino-tokenizers = pkgs.callPackage ./nix/openvino-tokenizers.nix {
+        inherit openvino;
+      };
     in
     {
       packages.${system} = {
         default = pkgs.callPackage ./nix/server.nix {
-          inherit openvino openvino-genai;
+          inherit openvino openvino-genai openvino-tokenizers;
         };
         inherit openvino;
         openvino-genai = openvino-genai;
+        openvino-tokenizers = openvino-tokenizers;
       };
 
       devShells.${system}.default = pkgs.mkShell {
@@ -67,7 +76,7 @@
           pkgs.pkg-config
           pkgs.openssl
           pkgs.nlohmann_json
-          pkgs.openvino-tokenizers
+          openvino-tokenizers
           openvino
           openvino-genai
           pkgs.drogon
@@ -79,7 +88,7 @@
           export OpenVINO_DIR="${openvino}/runtime/cmake"
           export CMAKE_PREFIX_PATH="${openvino-genai}:${pkgs.nlohmann_json}:${pkgs.drogon}:${openvino}/runtime"
           # genai dlopens libopenvino_tokenizers.so (see tokenizer/tokenizers_path.cpp).
-          export OPENVINO_TOKENIZERS_PATH_GENAI="${pkgs.openvino-tokenizers}/lib/libopenvino_tokenizers.so"
+          export OPENVINO_TOKENIZERS_PATH_GENAI="${openvino-tokenizers}/lib/libopenvino_tokenizers.so"
           export LD_LIBRARY_PATH="${openvino-genai}/lib:${openvino}/runtime/lib:${pkgs.drogon}/lib:''${LD_LIBRARY_PATH:-}"
           echo "openvino-server dev shell ready."
           echo "  cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release"
