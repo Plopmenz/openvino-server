@@ -1,0 +1,12 @@
+build/
+build-*/
+*.o
+*.so
+*.a
+compile_commands.json
+.cache/
+output/
+models/output/
+models/
+result/
+result
