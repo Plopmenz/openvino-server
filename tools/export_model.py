@@ -29,19 +29,11 @@ def main() -> int:
     parser.add_argument("--device", default="CPU", help="Inference device to target (CPU/GPU)")
     args = parser.parse_args()
 
-    try:
-        from optimum.intel import OVText2ImagePipeline
-    except ImportError as exc:
-        print(
-            "optimum-intel is required. "
-            "Install with: pip install optimum-intel diffusers transformers --upgrade",
-            file=sys.stderr,
-        )
-        return 1
+    from optimum.intel import OVQwenImagePipeline
 
     os.makedirs(args.output, exist_ok=True)
     print(f"Exporting {args.model} -> {args.output} (device={args.device})")
-    ov_pipe = OVText2ImagePipeline.from_pretrained(
+    ov_pipe = OVQwenImagePipeline.from_pretrained(
         args.model, export=True, device=args.device
     )
     ov_pipe.save_pretrained(args.output)

@@ -5,10 +5,14 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <list>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include <openvino/genai/image_generation/generation_config.hpp>
 #include <openvino/genai/image_generation/text2image_pipeline.hpp>
 
 namespace ovserver {
@@ -34,12 +38,49 @@ struct ImageResult {
     std::vector<std::uint8_t> data;
 };
 
+// Parameters that determine the compile-time static shapes and therefore group
+// requests that can share one compiled pipeline. Guidance and num_images are
+// bucketed because genai's reshape treats every value > 1 the same.
+struct CompileKey {
+    int num_images_bucket;
+    int guidance_bucket;
+    int64_t height;
+    int64_t width;
+
+    bool operator<(const CompileKey& o) const {
+        if (num_images_bucket != o.num_images_bucket) {
+            return num_images_bucket < o.num_images_bucket;
+        }
+        if (guidance_bucket != o.guidance_bucket) {
+            return guidance_bucket < o.guidance_bucket;
+        }
+        if (height != o.height) {
+            return height < o.height;
+        }
+        return width < o.width;
+    }
+
+    bool operator==(const CompileKey& o) const {
+        return num_images_bucket == o.num_images_bucket &&
+               guidance_bucket == o.guidance_bucket && height == o.height &&
+               width == o.width;
+    }
+};
+
 class Model {
 public:
+    // Each stage can run on its own device (genai's staged compile). Empty
+    // per-stage devices fall back to `device`.
     Model(const std::string& id,
           const std::filesystem::path& models_path,
           const std::string& device,
-          const ov::AnyMap& properties);
+          const ov::AnyMap& properties,
+          std::string text_encoder_device = "",
+          std::string transformer_device = "",
+          std::string vae_device = "",
+          bool static_shapes = true,
+          bool bound_dynamic = false,
+          bool naive = false);
 
     const std::string& id() const { return m_id; }
 
@@ -47,13 +88,46 @@ public:
     std::vector<ImageResult> generate(const GenerateOptions& opts);
 
 private:
+    // Returns a clone of the compiled pipeline matching the config's
+    // shape-sensitive parameters, compiling it on first use for each key.
+    ov::genai::Text2ImagePipeline compiled_pipeline(
+        const ov::genai::ImageGenerationConfig& generation_config);
+
+    // Returns a clone of a single Text2ImagePipeline(model_path, device),
+    // built lazily on first use. This mirrors the plain Python/optimum path:
+    // no reshape, no staged compile, no per-shape keys.
+    ov::genai::Text2ImagePipeline naive_pipeline();
+
+    static constexpr std::size_t kMaxCompiledPipelines = 4;
+
     std::string m_id;
-    ov::genai::Text2ImagePipeline m_pipeline;
+    std::filesystem::path m_models_path;
+    std::string m_device;
+    std::string m_text_encoder_device;
+    std::string m_transformer_device;
+    std::string m_vae_device;
+    bool m_static_shapes;
+    bool m_bound_dynamic;
+    bool m_naive;
+    ov::AnyMap m_properties;
+    ov::genai::ImageGenerationConfig m_default_config;
+
+    std::mutex m_mutex;
+    std::map<CompileKey, std::shared_ptr<ov::genai::Text2ImagePipeline>>
+        m_compiled;
+    std::list<CompileKey> m_lru;
+    std::shared_ptr<ov::genai::Text2ImagePipeline> m_naive_pipeline;
 };
 
 struct ModelSpec {
     std::filesystem::path path;
     std::string device;
+    std::string text_encoder_device;
+    std::string transformer_device;
+    std::string vae_device;
+    bool static_shapes = true;
+    bool bound_dynamic = false;
+    bool naive = false;
     ov::AnyMap properties;
 };
 

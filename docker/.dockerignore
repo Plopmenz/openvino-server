@@ -1,0 +1,14 @@
+# Send only the Dockerfile as build context; the openvino stack is cloned
+# inside the image, and the host repo artifacts are irrelevant to it.
+.git
+build
+result
+third_party
+include
+src
+nix
+conf
+tools
+flake.nix
+flake.lock
+README.md

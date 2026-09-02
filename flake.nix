@@ -2,8 +2,7 @@
   description = "openvino-server: OpenAI-compatible image generation server for OpenVINO GenAI (Qwen-Image) on Drogon";
 
   inputs = {
-    # Pinned to the same nixpkgs revision the host system resolves to.
-    nixpkgs.url = "github:NixOS/nixpkgs/567a49d1913ce81ac6e9582e3553dd90a955875f";
+    nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
   };
 
   outputs =
@@ -29,9 +28,9 @@
         src = pkgs.fetchFromGitHub {
           owner = "openvinotoolkit";
           repo = "openvino";
-          rev = "ec4aa1d1588029f91e85bd1bf35b86a4f7e6a072";
+          rev = "f1a195380ab7a0ee95a94b2d2de655d23d0b784b";
           fetchSubmodules = true;
-          hash = "sha256-Hr7vlXGP1/Jv9yTpEOqM4atqkpbRU0hc2wGBxWTb3EY=";
+          hash = "sha256-NR6OEagNIk4WW5XqKw0CkBg5IalqvrjEI5CCktWDIYs=";
         };
         meta = old.meta // {
           changelog = "https://github.com/openvinotoolkit/openvino";

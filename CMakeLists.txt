@@ -21,6 +21,8 @@ add_executable(openvino-server
     src/manager.cc
     src/controller.cc
     src/image.cc
+    src/image_decode.cc
+    src/vlm_model.cc
     src/base64.cc
 )
 
