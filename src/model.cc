@@ -3,6 +3,7 @@
 
 #include "ovserver/model.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -14,6 +15,7 @@
 #include <openvino/core/model.hpp>
 #include <openvino/core/partial_shape.hpp>
 #include <openvino/genai/image_generation/generation_config.hpp>
+#include <openvino/genai/image_generation/image_generation_perf_metrics.hpp>
 #include <openvino/pass/serialize.hpp>
 #include <openvino/runtime/core.hpp>
 
@@ -374,6 +376,51 @@ std::vector<ImageResult> Model::generate(const GenerateOptions& opts) {
                             .count();
     std::cerr << "[model '" << m_id << "'] " << wall_clock() << " generate done in "
               << gen_ms << " ms" << std::endl;
+
+    // Diagnostics: break the step time into transformer GPU infer vs the rest
+    // (host scheduler / latent round-trip) so a 10x-slow-GPU bug can be
+    // attributed to one or the other.
+    try {
+        ov::genai::ImageGenerationPerfMetrics pm = pipe.get_performance_metrics();
+        const auto& trans = pm.raw_metrics.transformer_inference_durations;
+        const auto& iters = pm.raw_metrics.iteration_durations;
+        const std::size_t n = std::min(trans.size(), iters.size());
+        std::cerr << "[model '" << m_id << "'] perf: load="
+                  << static_cast<int>(pm.load_time) << "ms generate="
+                  << static_cast<int>(pm.generate_duration) << "ms text_enc=";
+        for (const auto& [k, v] : pm.encoder_inference_duration) {
+            std::cerr << k << "=" << static_cast<int>(v) << "ms ";
+        }
+        std::cerr << "\n[model '" << m_id << "'] perf: vae_dec="
+                  << static_cast<int>(pm.vae_decoder_inference_duration)
+                  << "ms  steps=" << n << std::endl;
+        if (n > 0) {
+            const auto iths = [](const std::vector<ov::genai::MicroSeconds>& v) {
+                double sum = 0;
+                for (const auto& x : v) sum += static_cast<double>(x.count());
+                return sum / static_cast<double>(v.size());
+            };
+            std::cerr << "[model '" << m_id << "'] perf: avg step="
+                      << static_cast<int64_t>(iths(iters) / 1000.0)
+                      << "ms  avg transformer-infer="
+                      << static_cast<int64_t>(iths(trans) / 1000.0)
+                      << "ms  (rest="
+                      << static_cast<int64_t>((iths(iters) - iths(trans)) /
+                                              1000.0)
+                      << "ms)"
+                      << "\n[model '" << m_id << "'] perf first steps (infer/total ms):";
+            for (std::size_t i = 0; i < std::min<std::size_t>(n, 5); ++i) {
+                std::cerr << " [" << i << "]="
+                          << static_cast<int64_t>(trans[i].count() / 1000.f)
+                          << "/"
+                          << static_cast<int64_t>(iters[i].count() / 1000.f);
+            }
+            std::cerr << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[model '" << m_id
+                  << "'] perf metrics unavailable: " << e.what() << std::endl;
+    }
 
     // result shape: [N, H, W, C] u8
     auto shape = result.get_shape();
