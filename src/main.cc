@@ -298,7 +298,7 @@ int main(int argc, char** argv) {
             ov::AnyMap props;
             try_set_device_props(device, cache_dir, gpu_optimize, props);
             ovserver::ModelManager::instance().load_vlm(
-                id, {p, device, props});
+                id, {p, device, props, {}, static_cast<unsigned>(threads)});
             LOG_INFO << "VLM model '" << id << "' loaded from " << vlm_models[i]
                      << " (device: " << device
                      << ") served at /v1/chat/completions";

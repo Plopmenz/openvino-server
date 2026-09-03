@@ -51,8 +51,9 @@ struct VLMResult {
     std::string finish_reason;  // "stop" | "length" | "abort"
 };
 
-// Tuning knobs for the continuous-batching scheduler. All values have sensible
-// defaults; cache_size=0 selects dynamic (unbounded) KV-cache allocation.
+// Tuning knobs for the continuous-batching scheduler, mirroring OVMS's
+// LLMCalculatorOptions proto defaults exactly. cache_size=0 selects dynamic
+// (unbounded) KV-cache allocation, which is OVMS's default.
 struct VLMSchedulerOptions {
     std::size_t max_num_batched_tokens = 256;
     std::size_t max_num_seqs = 256;
@@ -73,7 +74,8 @@ public:
              const std::filesystem::path& models_path,
              const std::string& device,
              const ov::AnyMap& properties = {},
-             const VLMSchedulerOptions& scheduler = {});
+             const VLMSchedulerOptions& scheduler = {},
+             unsigned rest_workers = 4);
 
     VLMModel(const VLMModel&) = delete;
     VLMModel& operator=(const VLMModel&) = delete;
@@ -93,6 +95,7 @@ private:
     std::string m_device;
     ov::AnyMap m_properties;
     VLMSchedulerOptions m_sched;
+    unsigned m_rest_workers = 4;
 
     std::shared_ptr<ov::genai::ContinuousBatchingPipeline> m_pipeline;
     ov::genai::Tokenizer m_tokenizer;
@@ -111,6 +114,7 @@ struct VLMModelSpec {
     std::string device;
     ov::AnyMap properties;
     VLMSchedulerOptions scheduler;
+    unsigned rest_workers = 4;
 };
 
 }  // namespace ovserver

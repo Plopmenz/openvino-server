@@ -7,14 +7,44 @@
 #include <cstddef>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <openvino/genai/scheduler_config.hpp>
 #include <openvino/genai/text_streamer.hpp>
+#include <openvino/runtime/properties.hpp>
 
 namespace ovserver {
 
 namespace {
+
+// Mirrors OVMS's ovms::applyDefaultCpuProperties: sensible CPU execution
+// defaults that are only meaningful on a CPU device. Outside a container the
+// Docker-detection guard in OVMS makes this a no-op, so we reproduce the same
+// effective result for a bare host (nothing is forced).
+void apply_default_cpu_properties(ov::AnyMap& props, unsigned core_count) {
+    if (props.find(ov::hint::enable_cpu_pinning.name()) == props.end()) {
+        props[ov::hint::enable_cpu_pinning.name()] = false;
+    }
+    if (props.find(ov::inference_num_threads.name()) == props.end() &&
+        core_count > 0) {
+        props[ov::inference_num_threads.name()] = static_cast<int>(core_count);
+    }
+}
+
+// Mirrors OVMS's ContinuousBatchingServableInitializer: the tokenizer /
+// detokenizer always run on CPU with a THROUGHPUT perf mode and a stream count
+// bounded by the REST worker count, passed to the pipeline as the dedicated
+// tokenizer plugin config (5th constructor argument).
+ov::AnyMap make_tokenizer_props(unsigned rest_workers, unsigned core_count) {
+    ov::AnyMap props;
+    props[ov::num_streams.name()] = static_cast<int>(
+        std::min(rest_workers, core_count));
+    props[ov::hint::performance_mode.name()] =
+        ov::hint::PerformanceMode::THROUGHPUT;
+    apply_default_cpu_properties(props, core_count);
+    return props;
+}
 
 std::string finish_reason_str(ov::genai::GenerationFinishReason r) {
     switch (r) {
@@ -42,14 +72,18 @@ VLMModel::VLMModel(const std::string& id,
                    const std::filesystem::path& models_path,
                    const std::string& device,
                    const ov::AnyMap& properties,
-                   const VLMSchedulerOptions& scheduler)
+                   const VLMSchedulerOptions& scheduler,
+                   unsigned rest_workers)
     : m_id(id),
       m_models_path(models_path),
       m_device(device),
       m_properties(properties),
       m_sched(scheduler),
+      m_rest_workers(rest_workers),
       m_pipeline(std::make_shared<ov::genai::ContinuousBatchingPipeline>(
-          models_path, make_scheduler(scheduler), device, properties)),
+          models_path, make_scheduler(scheduler), device, m_properties,
+          make_tokenizer_props(rest_workers,
+                               std::max(1u, std::thread::hardware_concurrency())))),
       m_tokenizer(m_pipeline->get_tokenizer()) {
     std::cerr << "[vlm model '" << id << "'] loaded from " << models_path
               << " device=" << device
@@ -59,6 +93,7 @@ VLMModel::VLMModel(const std::string& id,
               << ", cache_size=" << m_sched.cache_size
               << ", dynamic_split_fuse=" << m_sched.dynamic_split_fuse
               << ", prefix_caching=" << m_sched.enable_prefix_caching
+              << ", rest_workers=" << rest_workers
               << ")" << std::endl;
 
     m_executor = std::thread([this] { executor_run(); });

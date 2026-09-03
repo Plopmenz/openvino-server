@@ -44,7 +44,8 @@ void ModelManager::load_vlm(const std::string& id, const VLMModelSpec& spec) {
         throw std::runtime_error("vlm model '" + id + "' already loaded");
     }
     auto model = std::make_shared<VLMModel>(id, spec.path, spec.device,
-                                            spec.properties);
+                                            spec.properties, spec.scheduler,
+                                            spec.rest_workers);
     m_vlms.emplace(id, std::move(model));
 }
 
