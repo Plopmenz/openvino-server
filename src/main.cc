@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <openvino/runtime/properties.hpp>
+#include <openvino/runtime/intel_gpu/properties.hpp>
+#include <openvino/core/type/element_type.hpp>
 
 #include <drogon/drogon.h>
 
@@ -53,6 +55,20 @@ void usage(const char* argv0) {
         << "                          --no-reshape). Required on GPU: its plugin\n"
         << "                          throws 'get_tensor() is called for dynamic\n"
         << "                          shape without upper bound' on unbounded IRs.\n"
+        << "      --gpu-optimize     Apply the GPU compile knobs optimum-intel\n"
+        << "                          relies on, which the default genai static\n"
+        << "                          compile omits: FP16 inference precision\n"
+        << "                          (INFERENCE_PRECISION_HINT) and explicit SDPA\n"
+        << "                          fusion (GPU_ENABLE_SDPA_OPTIMIZATION). These\n"
+        << "                          are ignored by non-GPU plugins. Without them\n"
+        << "                          the static GPU denoiser is ~100x slower than\n"
+        << "                          optimum on the same export (176s/step vs 3s).\n"
+        << "      --bound-max N       Upper bound imposed on every dynamic dim by\n"
+        << "                          --bound-dynamic. Default: 4096. The default\n"
+        << "                          is too large for GPU (compile OOM/freeze);\n"
+        << "                          try 1024-2048 for a 512x512 Qwen deployment\n"
+        << "                          so the GPU compiles a bounded-dynamic model\n"
+        << "                          instead of a frozen static one.\n"
         << "      --naive             Run the plain pipeline exactly like the\n"
         << "                          Python/optimum path: construct\n"
         << "                          Text2ImagePipeline(path, device) on first use\n"
@@ -93,6 +109,7 @@ std::string get_arg(int argc, char** argv, int& i, const char* flag) {
 
 bool try_set_device_props(const std::string& device,
                           const std::string& cache_dir,
+                          const bool gpu_optimize,
                           ov::AnyMap& props) {
     if (!cache_dir.empty()) {
         props[ov::cache_dir.name()] = cache_dir;
@@ -101,7 +118,17 @@ bool try_set_device_props(const std::string& device,
     // inference, which has been seen to deadlock the first denoising step when
     // combined with per-request pipeline cloning (see tools/*gpu*.py runs that
     // complete with default hints).
-    (void)device;
+    // Under --gpu-optimize mirror the compile knobs optimum-intel uses on GPU:
+    // FP16 inference precision and explicit SDPA fusion. Without these the
+    // static GPU denoiser is ~100x slower than optimum on the same export. The
+    // properties are inert on CPU/AUTO (they only affect a GPU device), so they
+    // can be applied unconditionally.
+    if (gpu_optimize &&
+        (device.find("GPU") != std::string::npos ||
+         device.find("AUTO") != std::string::npos)) {
+        props[ov::hint::inference_precision.name()] = ov::element::f16;
+        props[ov::intel_gpu::hint::enable_sdpa_optimization.name()] = true;
+    }
     return true;
 }
 
@@ -119,6 +146,8 @@ int main(int argc, char** argv) {
     bool static_shapes = true;
     bool bound_dynamic = false;
     bool naive = false;
+    bool gpu_optimize = false;
+    int64_t bound_max = 4096;
     std::string host = "0.0.0.0";
     int port = 8080;
     int threads = 4;
@@ -152,6 +181,10 @@ int main(int argc, char** argv) {
                 bound_dynamic = true;
             } else if (a == "--naive") {
                 naive = true;
+            } else if (a == "--gpu-optimize") {
+                gpu_optimize = true;
+            } else if (a == "--bound-max") {
+                bound_max = std::stoll(get_arg(argc, argv, i, a.c_str()));
             } else if (a == "-h" || a == "--host") {
                 host = get_arg(argc, argv, i, a.c_str());
             } else if (a == "-p" || a == "--port") {
@@ -235,7 +268,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < models.size(); ++i) {
             auto id = model_ids.empty() ? std::string("qwen-image") : model_ids[i];
             ov::AnyMap props;
-            try_set_device_props(device, cache_dir, props);
+            try_set_device_props(device, cache_dir, gpu_optimize, props);
             ovserver::ModelManager::instance().load(
                 id,
                 {std::filesystem::path(models[i]),
@@ -246,6 +279,7 @@ int main(int argc, char** argv) {
                  static_shapes,
                  bound_dynamic,
                  naive,
+                 bound_max,
                  props});
             LOG_INFO << "Model '" << id << "' loaded from " << models[i]
                      << " (text-encoder: " << text_encoder_device
@@ -262,7 +296,7 @@ int main(int argc, char** argv) {
                           ? p.filename().string()
                           : vlm_model_ids[i];
             ov::AnyMap props;
-            try_set_device_props(device, cache_dir, props);
+            try_set_device_props(device, cache_dir, gpu_optimize, props);
             ovserver::ModelManager::instance().load_vlm(
                 id, {p, device, props});
             LOG_INFO << "VLM model '" << id << "' loaded from " << vlm_models[i]

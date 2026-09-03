@@ -31,8 +31,8 @@ ov::Core& shared_core() {
 // CPU plugin handles unbounded shapes natively, so only GPU runs need bounds.
 // Give every dynamic dim a finite upper bound, never widening an existing one.
 std::filesystem::path bound_shapes_copy(const std::filesystem::path& src,
-                                        const std::string& id) {
-    constexpr int64_t kMaxBound = 4096;
+                                        const std::string& id,
+                                        int64_t bound_max) {
     auto dst = std::filesystem::temp_directory_path() /
                ("ovserver-bounded-" +
                 (id.empty() ? std::string("model") : id));
@@ -45,7 +45,7 @@ std::filesystem::path bound_shapes_copy(const std::filesystem::path& src,
                                  ec.message());
     }
 
-    auto bound_xml = [](const std::filesystem::path& xml) {
+    auto bound_xml = [&bound_max](const std::filesystem::path& xml) {
         std::shared_ptr<ov::Model> model = shared_core().read_model(xml);
         std::map<std::string, ov::PartialShape> new_shapes;
         for (const auto& input : model->inputs()) {
@@ -65,8 +65,8 @@ std::filesystem::path bound_shapes_copy(const std::filesystem::path& src,
                 // existing bound; only fill in a finite upper where missing.
                 int64_t lo = std::max<int64_t>(1, dim.get_min_length());
                 int64_t hi = dim.get_max_length();
-                if (hi < 0 || hi > kMaxBound) {
-                    hi = kMaxBound;
+                if (hi < 0 || hi > bound_max) {
+                    hi = bound_max;
                 }
                 if (lo > hi) {
                     lo = hi;
@@ -179,7 +179,8 @@ Model::Model(const std::string& id,
              std::string vae_device,
              bool static_shapes,
              bool bound_dynamic,
-             bool naive)
+             bool naive,
+             int64_t bound_max)
     : m_id(id), m_models_path(models_path), m_device(device),
       m_text_encoder_device(text_encoder_device.empty() ? device
                                                         : text_encoder_device),
@@ -187,7 +188,7 @@ Model::Model(const std::string& id,
                                                       : transformer_device),
       m_vae_device(vae_device.empty() ? device : vae_device),
       m_static_shapes(static_shapes), m_bound_dynamic(bound_dynamic),
-      m_naive(naive), m_properties(properties) {
+      m_naive(naive), m_bound_max(bound_max), m_properties(properties) {
     if (m_naive) {
         // Naive mode mirrors the plain Python/optimum path exactly: the model
         // is handed to Text2ImagePipeline(path, device) unchanged and run
@@ -200,7 +201,7 @@ Model::Model(const std::string& id,
         // them; the copy keeps the original model dir untouched. Once the
         // dims are bounded, reshaping to static shapes would discard the
         // bounds, so static shaping is disabled alongside.
-        m_models_path = bound_shapes_copy(models_path, id);
+        m_models_path = bound_shapes_copy(models_path, id, m_bound_max);
         m_static_shapes = false;
     }
     // Discover the defaults (height, width, guidance, steps, ...) a request

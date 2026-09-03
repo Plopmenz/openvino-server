@@ -80,7 +80,8 @@ public:
           std::string vae_device = "",
           bool static_shapes = true,
           bool bound_dynamic = false,
-          bool naive = false);
+          bool naive = false,
+          int64_t bound_max = 4096);
 
     const std::string& id() const { return m_id; }
 
@@ -109,6 +110,7 @@ private:
     bool m_static_shapes;
     bool m_bound_dynamic;
     bool m_naive;
+    int64_t m_bound_max;
     ov::AnyMap m_properties;
     ov::genai::ImageGenerationConfig m_default_config;
 
@@ -128,6 +130,7 @@ struct ModelSpec {
     bool static_shapes = true;
     bool bound_dynamic = false;
     bool naive = false;
+    int64_t bound_max = 4096;
     ov::AnyMap properties;
 };
 
