@@ -67,7 +67,6 @@ ov::genai::SchedulerConfig make_scheduler(const VLMSchedulerOptions& o) {
 }
 
 }  // namespace
-
 VLMModel::VLMModel(const std::string& id,
                    const std::filesystem::path& models_path,
                    const std::string& device,
@@ -79,23 +78,27 @@ VLMModel::VLMModel(const std::string& id,
       m_device(device),
       m_properties(properties),
       m_sched(scheduler),
-      m_rest_workers(rest_workers),
-      m_pipeline(std::make_shared<ov::genai::ContinuousBatchingPipeline>(
-          models_path, make_scheduler(scheduler), device, m_properties,
-          make_tokenizer_props(rest_workers,
-                               std::max(1u, std::thread::hardware_concurrency())))),
-      m_tokenizer(m_pipeline->get_tokenizer()) {
-    std::cerr << "[vlm model '" << id << "'] loaded from " << models_path
-              << " device=" << device
-              << " (continuous-batching scheduler: max_num_batched_tokens="
-              << m_sched.max_num_batched_tokens
-              << ", max_num_seqs=" << m_sched.max_num_seqs
-              << ", cache_size=" << m_sched.cache_size
-              << ", dynamic_split_fuse=" << m_sched.dynamic_split_fuse
-              << ", prefix_caching=" << m_sched.enable_prefix_caching
-              << ", rest_workers=" << rest_workers
-              << ")" << std::endl;
+      m_rest_workers(rest_workers) {
 
+    const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+    ov::genai::SchedulerConfig sched_cfg = make_scheduler(scheduler);
+
+    std::cerr << "[vlm model '" << id << "'] constructing pipeline"
+              << " device=" << device
+              << " max_num_batched_tokens=" << sched_cfg.max_num_batched_tokens
+              << " num_kv_blocks=" << sched_cfg.num_kv_blocks
+              << " cache_size=" << sched_cfg.cache_size
+              << " dynamic_split_fuse=" << sched_cfg.dynamic_split_fuse
+              << " enable_prefix_caching=" << sched_cfg.enable_prefix_caching
+              << std::endl;
+
+    m_pipeline = std::make_shared<ov::genai::ContinuousBatchingPipeline>(
+        models_path, sched_cfg, device, m_properties,
+        make_tokenizer_props(rest_workers, cores));
+
+    m_tokenizer = m_pipeline->get_tokenizer();
+
+    std::cerr << "[vlm model '" << id << "'] loaded successfully" << std::endl;
     m_executor = std::thread([this] { executor_run(); });
 }
 

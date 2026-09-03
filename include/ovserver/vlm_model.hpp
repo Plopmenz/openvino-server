@@ -57,7 +57,7 @@ struct VLMResult {
 struct VLMSchedulerOptions {
     std::size_t max_num_batched_tokens = 256;
     std::size_t max_num_seqs = 256;
-    std::size_t cache_size = 0;       // GB; 0 => dynamic KV cache allocation
+    std::size_t cache_size = 10;       // GB; 0 => dynamic KV cache allocation
     bool dynamic_split_fuse = true;   // required for prompts longer than a batch
     bool enable_prefix_caching = false;
 };
