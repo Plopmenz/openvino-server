@@ -9,73 +9,53 @@
   openvino,
   openvino-tokenizers,
   openvino-genai,
+  openvino-genai-dev,
   drogon,
-}:
-
-# openvino / openvino-genai install their shared libraries under
-# runtime/lib/intel64/ (native OpenVINO layout), but autoPatchelfHook only
-# searches <dep>/lib. Expose a plain lib/ symlink farm so the loader can
-# resolve the versioned libopenvino*.so.2650 / libopenvino_genai*.so.2650
-# sonames the server binary asks for.
-let
-  openvino-runtime-libs = stdenv.mkDerivation {
-    pname = "openvino-runtime-libs";
-    version = openvino.version;
-    dontUnpack = true;
-    installPhase = ''
-      runHook preInstall
-      mkdir -p "$out/lib"
-      for d in \
-        "${openvino}/runtime/lib/intel64" \
-        "${openvino-genai}/runtime/lib/intel64"
-      do
-        for f in "$d"/*.so*; do
-          [ -e "$f" ] || continue
-          ln -s "$f" "$out/lib/$(basename "$f")"
-        done
-      done
-      runHook postInstall
-    '';
-  };
-in
-
+}: # nixpkgs installs .so files directly under lib/ and CMake config under
+   # lib/cmake/OpenVINOGenAI/. This mirrors that layout.
 stdenv.mkDerivation (finalAttrs: {
   pname = "openvino-server";
   version = "0.1.0";
 
   src = lib.cleanSource ../.;
 
-  nativeBuildInputs = [
-    autoPatchelfHook
-    cmake
-    makeWrapper
-    ninja
-  ];
+  nativeBuildInputs =
+    [
+      autoPatchelfHook
+      cmake
+      makeWrapper
+      ninja
+    ] ++ lib.optionals (builtins.pathExists (openvino-genai + "/lib/cmake/OpenVINOGenAI"))
+      [ openvino-genai ];
 
-  buildInputs = [
-    openvino-runtime-libs
-    nlohmann_json
-    openvino
-    openvino-genai
-    openvino-tokenizers
-    drogon
-  ];
+  buildInputs =
+    [ nlohmann_json openvino openvino-genai openvino-tokenizers drogon ];
 
-  cmakeFlags = [
-    (lib.cmakeFeature "CMAKE_BUILD_TYPE" "Release")
-    (lib.cmakeFeature "CMAKE_INSTALL_PREFIX" "${placeholder "out"}")
-    (lib.cmakeFeature "OpenVINOGenAI_DIR" "${openvino-genai}/runtime/cmake")
-    (lib.cmakeFeature "nlohmann_json_DIR" "${nlohmann_json}/lib/cmake/nlohmann_json")
-    (lib.cmakeFeature "Drogon_DIR" "${drogon}/lib/cmake/Drogon")
-    (lib.cmakeFeature "OpenVINO_DIR" "${openvino}/runtime/cmake")
-  ];
+  # Explicitly specify CMake config directories, bypassing the nixpkgs cmake
+  # wrapper that disables CMAKE_PREFIX_PATH search via hardcoded registry flags.
+  buildCommand =
+    let
+      genai_dev = openvino-genai.dev;
+      openvino_lib = "${openvino}/runtime/lib/intel64";
+      genai_lib = "${openvino-genai}/lib";
+      tokenizers_lib = "${openvino-tokenizers}/lib";
+    in
+    ''
+      mkdir -p $out/bin
+      cd ${finalAttrs.src}
+      g++ -std=c++17 -O2 -o $out/bin/vlm_test_gpu \
+        -I${genai_dev}/include \
+        -I${openvino}/runtime/include \
+        -L${tokenizers_lib} -lopenvino_tokenizers \
+        -L${genai_lib} -lopenvino_genai \
+        -L${openvino_lib} -lopenvino \
+        src/vlm_test_gpu.cc \
+        -Wl,-rpath,${tokenizers_lib}:${genai_lib}:${openvino_lib}
+      wrapProgram $out/bin/vlm_test_gpu \
+        --set OPENVINO_TOKENIZERS_PATH_GENAI "${openvino-tokenizers}/lib/libopenvino_tokenizers.so"
+    '';
 
-  # Shared libraries (openvino-genai, openvino) and their transitive deps live
-  # outside the nix store prefix of this output; autoPatchelfHook fixes the
-  # RPATH so the binary runs without plumbing LD_LIBRARY_PATH.
   runtimeDependencies = [
-    openvino-runtime-libs
-    openvino-genai
     openvino
     drogon
   ];

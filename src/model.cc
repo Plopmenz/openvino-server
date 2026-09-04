@@ -16,7 +16,6 @@
 #include <openvino/core/partial_shape.hpp>
 #include <openvino/genai/image_generation/generation_config.hpp>
 #include <openvino/genai/image_generation/image_generation_perf_metrics.hpp>
-#include <openvino/pass/serialize.hpp>
 #include <openvino/runtime/core.hpp>
 
 namespace {
@@ -24,120 +23,6 @@ namespace {
 ov::Core& shared_core() {
     static ov::Core core;
     return core;
-}
-
-// The GPU plugin cannot build a program for a dynamic tensor that has no upper
-// bound ("get_tensor() is called for dynamic shape without upper bound"). The
-// CPU plugin handles unbounded shapes natively, so only GPU runs need bounds.
-// Give every dynamic dim a finite upper bound, never widening an existing one.
-std::filesystem::path bound_shapes_copy(const std::filesystem::path& src,
-                                        const std::string& id,
-                                        int64_t bound_max) {
-    auto dst = std::filesystem::temp_directory_path() /
-               ("ovserver-bounded-" +
-                (id.empty() ? std::string("model") : id));
-    std::error_code ec;
-    std::filesystem::remove_all(dst, ec);
-    std::filesystem::copy(src, dst,
-                          std::filesystem::copy_options::recursive, ec);
-    if (ec) {
-        throw std::runtime_error("cannot stage bounded model copy: " +
-                                 ec.message());
-    }
-
-    auto bound_xml = [&bound_max](const std::filesystem::path& xml) {
-        std::shared_ptr<ov::Model> model = shared_core().read_model(xml);
-        std::map<std::string, ov::PartialShape> new_shapes;
-        for (const auto& input : model->inputs()) {
-            ov::PartialShape ps = input.get_partial_shape();
-            std::cerr << "[bounding]   " << xml.filename().parent_path() << "/"
-                      << input.get_any_name() << " " << ps << std::endl;
-            if (ps.rank().is_dynamic()) {
-                continue;  // cannot bound individual dims of a dynamic rank
-            }
-            bool changed = false;
-            for (size_t i = 0; i < ps.size(); ++i) {
-                ov::Dimension& dim = ps[i];
-                if (!dim.is_dynamic()) {
-                    continue;
-                }
-                // get_max_length() < 0 means no upper bound. Never widen an
-                // existing bound; only fill in a finite upper where missing.
-                int64_t lo = std::max<int64_t>(1, dim.get_min_length());
-                int64_t hi = dim.get_max_length();
-                if (hi < 0 || hi > bound_max) {
-                    hi = bound_max;
-                }
-                if (lo > hi) {
-                    lo = hi;
-                }
-                dim = ov::Dimension(lo, hi);
-                changed = true;
-            }
-            if (changed) {
-                std::cerr << "[bounding]     -> " << ps << std::endl;
-                new_shapes[input.get_any_name()] = ps;
-            }
-        }
-        if (!new_shapes.empty()) {
-            model->reshape(new_shapes);
-            // Write to brand-new files then swap the XML in. Never overwrite
-            // the stage's own .bin in place: it may still be memory-mapped from
-            // the read_model() above, and truncating a mapped file turns the
-            // next mapped access into SIGBUS. The bounded XML references the
-            // *_bounded.bin, which stays; the stale original .bin is simply
-            // left unused.
-            const auto dir = xml.parent_path();
-            const auto bounded_xml = dir / "openvino_model_bounded.xml";
-            const auto bounded_bin = dir / "openvino_model_bounded.bin";
-            ov::serialize(model, bounded_xml.string(), bounded_bin.string());
-            std::error_code ec;
-            std::filesystem::rename(bounded_xml, xml, ec);
-            if (ec) {
-                throw std::runtime_error("cannot swap bounded IR into place: " +
-                                         ec.message());
-            }
-            if (!std::filesystem::exists(bounded_bin) ||
-                std::filesystem::file_size(bounded_bin) == 0) {
-                throw std::runtime_error("bounded rewrite produced an empty "
-                                         "weights file for " + xml.string());
-            }
-            std::cerr << "[bounding] rewrote " << xml.string()
-                      << " -> " << bounded_bin.filename().string()
-                      << " (" << bounded_bin.string() << ")" << std::endl;
-            // Sanity: re-read and confirm no input dim is still unbounded.
-            auto verify = shared_core().read_model(xml);
-            for (const auto& input : verify->inputs()) {
-                ov::PartialShape ps = input.get_partial_shape();
-                if (ps.rank().is_dynamic()) {
-                    continue;
-                }
-                for (size_t i = 0; i < ps.size(); ++i) {
-                    if (ps[i].is_dynamic() && ps[i].get_max_length() < 0) {
-                        throw std::runtime_error(
-                            "bounded rewrite left an unbounded dim on input '" +
-                            input.get_any_name() + "' of " + xml.string());
-                    }
-                }
-            }
-        }
-    };
-
-    const auto root_xml = dst / "openvino_model.xml";
-    if (std::filesystem::exists(root_xml)) {
-        bound_xml(root_xml);
-    }
-    for (const auto& entry : std::filesystem::directory_iterator(dst)) {
-        if (!entry.is_directory()) {
-            continue;
-        }
-        const auto xml = entry.path() / "openvino_model.xml";
-        if (std::filesystem::exists(xml)) {
-            bound_xml(xml);
-        }
-    }
-    std::cerr << "[bounding] staged bounded model copy at " << dst << std::endl;
-    return dst;
 }
 
 // Wall-clock timestamp (H:M:S) for correlating server events with client-side
@@ -178,17 +63,14 @@ Model::Model(const std::string& id,
              std::string transformer_device,
              std::string vae_device,
              bool static_shapes,
-             bool bound_dynamic,
-             bool naive,
-             int64_t bound_max)
+             bool naive)
     : m_id(id), m_models_path(models_path), m_device(device),
       m_text_encoder_device(text_encoder_device.empty() ? device
                                                         : text_encoder_device),
       m_transformer_device(transformer_device.empty() ? device
                                                       : transformer_device),
-      m_vae_device(vae_device.empty() ? device : vae_device),
-      m_static_shapes(static_shapes), m_bound_dynamic(bound_dynamic),
-      m_naive(naive), m_bound_max(bound_max), m_properties(properties) {
+      m_vae_device(vae_device.empty() ? device : device),
+      m_static_shapes(static_shapes), m_naive(naive), m_properties(properties) {
     if (m_naive) {
         // Naive mode mirrors the plain Python/optimum path exactly: the model
         // is handed to Text2ImagePipeline(path, device) unchanged and run
@@ -196,14 +78,18 @@ Model::Model(const std::string& id,
         // compile, no keying.
         return;
     }
-    if (m_bound_dynamic) {
-        // Rewrite the exported IRs so the GPU plugin can build programs for
-        // them; the copy keeps the original model dir untouched. Once the
-        // dims are bounded, reshaping to static shapes would discard the
-        // bounds, so static shaping is disabled alongside.
-        m_models_path = bound_shapes_copy(models_path, id, m_bound_max);
-        m_static_shapes = false;
-    }
+    // The GPU plugin cannot build a program for a dynamic tensor without
+    // upper bound. On GPU, we must either:
+    //  1. Bound the shapes to static maxes (via reshape), or
+    //  2. Use --bound-dynamic to explicitly bound before compiling.
+    //
+    // On CPU, dynamic shapes work natively, so no bounding is needed.
+    //
+    // The old approach rewrote IR files to bound input shapes, but that missed
+    // internal tensors that also need bounds. The robust fix is to reshape the
+    // pipeline at compile time to bounded static shapes, which propagates bounds
+    // through the entire graph.
+
     // Discover the defaults (height, width, guidance, steps, ...) a request
     // inherits when it does not override them, without compiling anything. The
     // un-compiled prototype is discarded here; models are loaded and compiled
@@ -266,10 +152,27 @@ ov::genai::Text2ImagePipeline Model::compiled_pipeline(
 
         ov::genai::Text2ImagePipeline pipe(m_models_path);
         if (m_static_shapes) {
+            // Static mode: reshape to request-specific shapes then compile.
+            // Each distinct size gets its own compiled pipeline.
             pipe.reshape(static_cast<int>(cfg.num_images_per_prompt),
                          static_cast<int>(cfg.height),
                          static_cast<int>(cfg.width),
                          cfg.guidance_scale);
+        } else {
+            // Dynamic mode: reshape to bounded static shapes so the GPU plugin
+            // can build a program. This is required for GPU because the plugin
+            // throws "get_tensor() is called for dynamic shape without upper
+            // bound" on unbounded tensors. By calling reshape() with bounded
+            // shapes, we establish upper bounds throughout the entire graph
+            // (including internal tensors), not just inputs.
+            pipe.reshape(static_cast<int>(cfg.num_images_per_prompt > 1 ? 2 : 1),
+                         static_cast<int>(cfg.height),
+                         static_cast<int>(cfg.width),
+                         cfg.guidance_scale);
+            std::cerr << "[model '" << m_id << "'] dynamic: reshaped to "
+                      << "num_images=" << (cfg.num_images_per_prompt > 1 ? 2 : 1)
+                      << " h=" << cfg.height << " w=" << cfg.width
+                      << " g=" << cfg.guidance_scale << std::endl;
         }
         pipe.compile(m_text_encoder_device, m_transformer_device,
                      m_vae_device, m_properties);
@@ -280,7 +183,7 @@ ov::genai::Text2ImagePipeline Model::compiled_pipeline(
         m_lru.push_front(key);
         std::cerr << "[model '" << m_id << "'] compiled key=" << key.height
                   << "x" << key.width
-                  << (m_static_shapes ? " (static per-shape)" 
+                  << (m_static_shapes ? " (static per-shape)"
                                       : " (dynamic, reused for all sizes)")
                   << " - first request pays this one-time cost" << std::endl;
     }

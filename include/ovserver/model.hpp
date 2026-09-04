@@ -79,9 +79,7 @@ public:
           std::string transformer_device = "",
           std::string vae_device = "",
           bool static_shapes = true,
-          bool bound_dynamic = false,
-          bool naive = false,
-          int64_t bound_max = 4096);
+          bool naive = false);
 
     const std::string& id() const { return m_id; }
 
@@ -128,9 +126,7 @@ struct ModelSpec {
     std::string transformer_device;
     std::string vae_device;
     bool static_shapes = true;
-    bool bound_dynamic = false;
     bool naive = false;
-    int64_t bound_max = 4096;
     ov::AnyMap properties;
 };
 

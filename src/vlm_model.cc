@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <utility>
@@ -13,15 +14,14 @@
 #include <openvino/genai/scheduler_config.hpp>
 #include <openvino/genai/text_streamer.hpp>
 #include <openvino/runtime/properties.hpp>
+#include <openvino/runtime/core.hpp>
 
 namespace ovserver {
 
 namespace {
 
 // Mirrors OVMS's ovms::applyDefaultCpuProperties: sensible CPU execution
-// defaults that are only meaningful on a CPU device. Outside a container the
-// Docker-detection guard in OVMS makes this a no-op, so we reproduce the same
-// effective result for a bare host (nothing is forced).
+// defaults that are only meaningful on a CPU device.
 void apply_default_cpu_properties(ov::AnyMap& props, unsigned core_count) {
     if (props.find(ov::hint::enable_cpu_pinning.name()) == props.end()) {
         props[ov::hint::enable_cpu_pinning.name()] = false;
@@ -66,7 +66,28 @@ ov::genai::SchedulerConfig make_scheduler(const VLMSchedulerOptions& o) {
     return cfg;
 }
 
+bool is_gpu_device(const std::string& device) {
+    return device.find("GPU") != std::string::npos;
+}
+
+// Build the plugin properties map for the pipeline.
+// For GPU: set ATTENTION_BACKEND=SDPA so the pipeline internally handles
+// shape bounding at the GenAI layer.
+ov::AnyMap build_plugin_props(const ov::AnyMap& properties,
+                              const ov::genai::SchedulerConfig& sched_cfg,
+                              const std::string& device) {
+    ov::AnyMap props = properties;
+    if (is_gpu_device(device)) {
+        props["ATTENTION_BACKEND"] = "SDPA";
+    }
+    // Activate continuous batching mode via the scheduler_config property.
+    // This is how OVMS activates CB pipeline through LLMPipeline.
+    props[ov::genai::scheduler_config.name()] = sched_cfg;
+    return props;
+}
+
 }  // namespace
+
 VLMModel::VLMModel(const std::string& id,
                    const std::filesystem::path& models_path,
                    const std::string& device,
@@ -92,9 +113,24 @@ VLMModel::VLMModel(const std::string& id,
               << " enable_prefix_caching=" << sched_cfg.enable_prefix_caching
               << std::endl;
 
-    m_pipeline = std::make_shared<ov::genai::ContinuousBatchingPipeline>(
-        models_path, sched_cfg, device, m_properties,
-        make_tokenizer_props(rest_workers, cores));
+    if (is_gpu_device(device)) {
+        // GPU: use LLMPipeline with continuous batching via scheduler_config property.
+        // This is the same approach OVMS uses. LLMPipeline handles shape bounding
+        // at the GenAI level internally (ATTENTION_BACKEND=SDPA).
+        std::cerr << "[vlm model '" << id << "'] GPU mode: LLMPipeline with CB"
+                  << std::endl;
+        auto plugin_props = build_plugin_props(properties, sched_cfg, device);
+        m_pipeline = std::make_shared<ov::genai::LLMPipeline>(
+            models_path, device, plugin_props);
+    } else {
+        // CPU: use ContinuousBatchingPipeline directly.
+        std::cerr << "[vlm model '" << id << "'] CPU mode: CB pipeline"
+                  << std::endl;
+        m_pipeline = std::make_shared<ov::genai::ContinuousBatchingPipeline>(
+            models_path, sched_cfg, device,
+            properties,
+            make_tokenizer_props(rest_workers, cores));
+    }
 
     m_tokenizer = m_pipeline->get_tokenizer();
 
@@ -156,8 +192,7 @@ VLMResult VLMModel::generate(const VLMGenerateOptions& opts) {
     }
     if (opts.rng_seed) cfg.rng_seed = *opts.rng_seed;
 
-    // Build the templated prompt so the model's own chat_template (with any
-    // system message) is applied, mirroring how OVMS feeds the CB backend.
+    // Build the templated prompt so the model's own chat_template is applied
     ov::genai::ChatHistory history;
     if (!opts.system_message.empty()) {
         history.push_back({{"role", "system"}, {"content", opts.system_message}});
@@ -191,9 +226,7 @@ VLMResult VLMModel::generate(const VLMGenerateOptions& opts) {
     bool aborted = false;
     while (handle->get_status() == ov::genai::GenerationStatus::RUNNING ||
            handle->can_read()) {
-        // read() blocks until the scheduler pushes the next batch of generated
-        // tokens for this request; the background executor drives step().
-        ov::genai::GenerationOutputs outputs = handle->read();
+        ov::gen::GenerationOutputs outputs = handle->read();
         for (auto& [rid, out] : outputs) {
             if (out.finish_reason != ov::genai::GenerationFinishReason::NONE) {
                 finish = out.finish_reason;

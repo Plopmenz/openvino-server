@@ -23,9 +23,7 @@ void ModelManager::load(const std::string& id, const ModelSpec& spec) {
                                          spec.transformer_device,
                                          spec.vae_device,
                                          spec.static_shapes,
-                                         spec.bound_dynamic,
-                                         spec.naive,
-                                         spec.bound_max);
+                                         spec.naive);
     m_models.emplace(id, std::move(model));
 }
 

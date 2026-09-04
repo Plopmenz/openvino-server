@@ -50,11 +50,9 @@ void usage(const char* argv0) {
         << "                          dynamic vs static on a device, since the GPU\n"
         << "                          plugin stalls on the static denoiser while the\n"
         << "                          dynamic path completes (producing noise).\n"
-        << "      --bound-dynamic    Stage a copy of the model whose dynamic dims\n"
-        << "                          all get finite upper bounds (implies\n"
-        << "                          --no-reshape). Required on GPU: its plugin\n"
-        << "                          throws 'get_tensor() is called for dynamic\n"
-        << "                          shape without upper bound' on unbounded IRs.\n"
+        << "      --bound-dynamic    [DEPRECATED] No longer needed: GPU now automatically\n"
+        << "                          bounds dynamic shapes at compile time. This flag\n"
+        << "                          is a no-op.\n"
         << "      --gpu-optimize     Apply the GPU compile knobs optimum-intel\n"
         << "                          relies on, which the default genai static\n"
         << "                          compile omits: FP16 inference precision\n"
@@ -63,12 +61,9 @@ void usage(const char* argv0) {
         << "                          are ignored by non-GPU plugins. Without them\n"
         << "                          the static GPU denoiser is ~100x slower than\n"
         << "                          optimum on the same export (176s/step vs 3s).\n"
-        << "      --bound-max N       Upper bound imposed on every dynamic dim by\n"
-        << "                          --bound-dynamic. Default: 4096. The default\n"
-        << "                          is too large for GPU (compile OOM/freeze);\n"
-        << "                          try 1024-2048 for a 512x512 Qwen deployment\n"
-        << "                          so the GPU compiles a bounded-dynamic model\n"
-        << "                          instead of a frozen static one.\n"
+        << "      --bound-max N       [REMOVED] No longer used: GPU now automatically\n"
+        << "                          bounds shapes at compile time. Default: 4096\n"
+        << "                          (still stored, silently ignored).\n"
         << "      --naive             Run the plain pipeline exactly like the\n"
         << "                          Python/optimum path: construct\n"
         << "                          Text2ImagePipeline(path, device) on first use\n"
@@ -76,10 +71,13 @@ void usage(const char* argv0) {
         << "                          compile, no shape keys. A/B test for the\n"
         << "                          other flags: if naive output differs, our\n"
         << "                          serving machinery is changing the result.\n"
+        << "                          Note: --naive only works on CPU. GPU requires\n"
+        << "                          bounded shapes at compile time.\n"
         << "  -V, --vlm-model PATH    Path to an exported OpenVINO GenAI VLM (vision\n"
         << "                          language model) directory, e.g. Qwen2.5-VL /\n"
         << "                          Qwen3-VL / Qwen3.6-35B-A3B. May be repeated.\n"
-        << "                          Served via /v1/chat/completions.\n"
+        << "                          Served via /v1/chat/completions. GPU fully\n"
+        << "                          supported: dynamic shapes bound automatically.\n"
         << "      --vlm-model-id ID    Model id for the corresponding --vlm-model.\n"
         << "                          Default: the directory basename. When multiple\n"
         << "                          VLM models are given each requires an id.\n"
@@ -144,10 +142,8 @@ int main(int argc, char** argv) {
     std::string transformer_device;
     std::string vae_device;
     bool static_shapes = true;
-    bool bound_dynamic = false;
     bool naive = false;
     bool gpu_optimize = false;
-    int64_t bound_max = 4096;
     std::string host = "0.0.0.0";
     int port = 8080;
     int threads = 4;
@@ -178,13 +174,12 @@ int main(int argc, char** argv) {
             } else if (a == "--no-reshape") {
                 static_shapes = false;
             } else if (a == "--bound-dynamic") {
-                bound_dynamic = true;
+                std::cerr << "warning: --bound-dynamic is now automatic on GPU "
+                          << "and can be omitted" << std::endl;
             } else if (a == "--naive") {
                 naive = true;
             } else if (a == "--gpu-optimize") {
                 gpu_optimize = true;
-            } else if (a == "--bound-max") {
-                bound_max = std::stoll(get_arg(argc, argv, i, a.c_str()));
             } else if (a == "-h" || a == "--host") {
                 host = get_arg(argc, argv, i, a.c_str());
             } else if (a == "-p" || a == "--port") {
@@ -236,6 +231,12 @@ int main(int argc, char** argv) {
         std::cerr << "error: --vlm-model-id given but no --vlm-model\n";
         return 2;
     }
+    // Warn that --naive does not work on GPU (dynamic shapes need bounding).
+    if (naive && (device.find("GPU") != std::string::npos ||
+                  device.find("AUTO") != std::string::npos)) {
+        std::cerr << "warning: --naive does not work on GPU (dynamic shapes "
+                  << "require bounding); use CPU or remove --naive" << std::endl;
+    }
 
     drogon::HttpAppFramework& app = drogon::app();
 
@@ -277,17 +278,18 @@ int main(int argc, char** argv) {
                  transformer_device,
                  vae_device,
                  static_shapes,
-                 bound_dynamic,
                  naive,
-                 bound_max,
                  props});
             LOG_INFO << "Model '" << id << "' loaded from " << models[i]
                      << " (text-encoder: " << text_encoder_device
                      << ", transformer: " << transformer_device
                      << ", vae: " << vae_device
                      << ", static_shapes: " << static_shapes
-                     << ", bound_dynamic: " << bound_dynamic
-                     << ", naive: " << naive << ")";
+                     << ", naive: " << naive
+                     << (device.find("GPU") != std::string::npos
+                             ? ", GPU (bounds applied automatically)"
+                             : ", CPU")
+                     << ")";
         }
 
         for (size_t i = 0; i < vlm_models.size(); ++i) {
