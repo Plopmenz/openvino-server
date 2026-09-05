@@ -19,6 +19,7 @@
   # local repositories so nothing is compiled through bazel for them.
   openvino,
   openvino-genai,
+  openvino-tokenizers,
   opencv,
   curl,
   openssl,
@@ -43,7 +44,7 @@ let
   src = fetchFromGitHub {
     owner = "openvinotoolkit";
     repo = "model_server";
-    rev = "3a28d490b704fc7021ced337d2240abe818a1e09";
+    tag = "v${version}";
     hash = "sha256-7XcETkFiMLWI7LHrThlcedrpYHhxBXPfwe/Qw9toSVs=";
   };
 
@@ -56,7 +57,8 @@ let
     "--noenable_bzlmod"
     # mdl dpf python etc
     "--repo_env=PYTHON_BIN_PATH=${python3}/bin/python3"
-    "--define=MEDIAPIPE_DISABLE=1"
+    "--define=GPU=1"
+    "--define=MEDIAPIPE_DISABLE=0"
     "--define=PYTHON_DISABLE=1"
     "--define=CLOUD_DISABLE=1"
   ];
@@ -281,7 +283,8 @@ EOF
 
       outputHashAlgo = "sha256";
       outputHashMode = "flat";
-      outputHash = "sha256-2y1VJLnsSYyFG9Gsn48Uhe55H6B66XorCcvQ+T75wsI=";
+#      outputHash = "sha256-2y1VJLnsSYyFG9Gsn48Uhe55H6B66XorCcvQ+T75wsI=";
+      outputHash = "sha256-ILHx1+VL/PyG49j1FtqSWPL8U6GK+9tDzMZ8JcQWRjM=";
       allowedRequisites = [ ];
       # The tar contains /nix/store strings (env configs, symlink rewrites) that
       # are not real runtime dependencies; phase 2 regenerates them.
@@ -471,7 +474,7 @@ stdenv.mkDerivation {
     # dlopened OpenVINO plugins & frontends are looked up relative to where
     # libopenvino.so is found at runtime; this is a safety net.
     wrapProgram $out/bin/ovms \
-      --prefix LD_LIBRARY_PATH : "${openvino}/lib:${opencv}/lib:${tbb}/lib:${ocl-icd}/lib"
+      --prefix LD_LIBRARY_PATH : "${openvino}/lib:${openvino-genai}/lib:${openvino-tokenizers}/lib:${opencv}/lib:${tbb}/lib:${ocl-icd}/lib"
   '';
 
   meta = {

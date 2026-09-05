@@ -9,7 +9,6 @@
   openvino,
   openvino-tokenizers,
   openvino-genai,
-  openvino-genai-dev,
   drogon,
 }: # nixpkgs installs .so files directly under lib/ and CMake config under
    # lib/cmake/OpenVINOGenAI/. This mirrors that layout.
@@ -25,35 +24,19 @@ stdenv.mkDerivation (finalAttrs: {
       cmake
       makeWrapper
       ninja
-    ] ++ lib.optionals (builtins.pathExists (openvino-genai + "/lib/cmake/OpenVINOGenAI"))
-      [ openvino-genai ];
+    ];
 
   buildInputs =
     [ nlohmann_json openvino openvino-genai openvino-tokenizers drogon ];
 
-  # Explicitly specify CMake config directories, bypassing the nixpkgs cmake
-  # wrapper that disables CMAKE_PREFIX_PATH search via hardcoded registry flags.
-  buildCommand =
-    let
-      genai_dev = openvino-genai.dev;
-      openvino_lib = "${openvino}/runtime/lib/intel64";
-      genai_lib = "${openvino-genai}/lib";
-      tokenizers_lib = "${openvino-tokenizers}/lib";
-    in
-    ''
-      mkdir -p $out/bin
-      cd ${finalAttrs.src}
-      g++ -std=c++17 -O2 -o $out/bin/vlm_test_gpu \
-        -I${genai_dev}/include \
-        -I${openvino}/runtime/include \
-        -L${tokenizers_lib} -lopenvino_tokenizers \
-        -L${genai_lib} -lopenvino_genai \
-        -L${openvino_lib} -lopenvino \
-        src/vlm_test_gpu.cc \
-        -Wl,-rpath,${tokenizers_lib}:${genai_lib}:${openvino_lib}
-      wrapProgram $out/bin/vlm_test_gpu \
-        --set OPENVINO_TOKENIZERS_PATH_GENAI "${openvino-tokenizers}/lib/libopenvino_tokenizers.so"
-    '';
+  cmakeFlags = [
+    (lib.cmakeFeature "CMAKE_BUILD_TYPE" "Release")
+    (lib.cmakeFeature "CMAKE_INSTALL_PREFIX" "${placeholder "out"}")
+    (lib.cmakeFeature "OpenVINOGenAI_DIR" "${openvino-genai.dev}/lib/cmake")
+    (lib.cmakeFeature "nlohmann_json_DIR" "${nlohmann_json}/lib/cmake/nlohmann_json")
+    (lib.cmakeFeature "Drogon_DIR" "${drogon}/lib/cmake/Drogon")
+    (lib.cmakeFeature "OpenVINO_DIR" "${openvino.dev}/lib/cmake")
+  ];
 
   runtimeDependencies = [
     openvino

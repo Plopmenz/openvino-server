@@ -72,7 +72,7 @@
 
        # OVMS v2026.3.1 built against our custom OpenVINO stack
        openvino-model-server = pkgs.callPackage ./nix/openvino-model-server.nix {
-         inherit openvino openvino-genai;
+         inherit openvino openvino-genai openvino-tokenizers;
        };
      in
     {
@@ -97,8 +97,7 @@
         };
         # Local build (from GitHub master):
         default = pkgs.callPackage ./nix/server.nix {
-          inherit openvino openvino-genai openvino-tokenizers;
-          openvino-genai-dev = openvino-genai.dev;
+          inherit (pkgs) openvino openvino-genai openvino-tokenizers;
         };
         inherit openvino;
         openvino-genai = openvino-genai;

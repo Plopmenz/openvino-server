@@ -113,24 +113,12 @@ VLMModel::VLMModel(const std::string& id,
               << " enable_prefix_caching=" << sched_cfg.enable_prefix_caching
               << std::endl;
 
-    if (is_gpu_device(device)) {
-        // GPU: use LLMPipeline with continuous batching via scheduler_config property.
-        // This is the same approach OVMS uses. LLMPipeline handles shape bounding
-        // at the GenAI level internally (ATTENTION_BACKEND=SDPA).
-        std::cerr << "[vlm model '" << id << "'] GPU mode: LLMPipeline with CB"
-                  << std::endl;
-        auto plugin_props = build_plugin_props(properties, sched_cfg, device);
-        m_pipeline = std::make_shared<ov::genai::LLMPipeline>(
-            models_path, device, plugin_props);
-    } else {
-        // CPU: use ContinuousBatchingPipeline directly.
         std::cerr << "[vlm model '" << id << "'] CPU mode: CB pipeline"
                   << std::endl;
         m_pipeline = std::make_shared<ov::genai::ContinuousBatchingPipeline>(
             models_path, sched_cfg, device,
             properties,
             make_tokenizer_props(rest_workers, cores));
-    }
 
     m_tokenizer = m_pipeline->get_tokenizer();
 
@@ -226,7 +214,7 @@ VLMResult VLMModel::generate(const VLMGenerateOptions& opts) {
     bool aborted = false;
     while (handle->get_status() == ov::genai::GenerationStatus::RUNNING ||
            handle->can_read()) {
-        ov::gen::GenerationOutputs outputs = handle->read();
+        ov::genai::GenerationOutputs outputs = handle->read();
         for (auto& [rid, out] : outputs) {
             if (out.finish_reason != ov::genai::GenerationFinishReason::NONE) {
                 finish = out.finish_reason;
