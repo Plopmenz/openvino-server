@@ -41,7 +41,7 @@ def main():
     print(f"\nAttempting LLMPipeline on GPU...")
 
     try:
-        pipe = ovgenai.LLMPipeline(model_path, device)
+        pipe = ovgenai.VLMPipeline(model_path, device)
         print("SUCCESS: LLMPipeline created on GPU")
         result = pipe.generate(prompt, max_new_tokens=max_new_tokens)
         print(f"\nResult: {result}")

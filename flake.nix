@@ -32,6 +32,7 @@
           fetchSubmodules = true;
           hash = "sha256-Izno1afpXxiqMVrlyDvTHXsnJ9wo0Q63IlEjdKrTzqc=";
         };
+        cmakeFlags = (pkgs.lib.remove (pkgs.lib.cmakeBool "ENABLE_ONEDNN_FOR_GPU" false) old.cmakeFlags) ++ [ (pkgs.lib.cmakeBool "ENABLE_ONEDNN_FOR_GPU" true) ];
       });
 
       # openvino-genai built from master so that Qwen-Image support is available.
