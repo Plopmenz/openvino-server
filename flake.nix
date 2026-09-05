@@ -71,7 +71,9 @@
        openvino-tokenizers-python = pkgs.python3Packages.openvino-tokenizers.override { openvino = openvino-python; openvino-tokenizers-native = openvino-tokenizers; };
 
        # OVMS v2026.3.1 built against our custom OpenVINO stack
-       openvino-model-server = pkgs.callPackage ./nix/openvino-model-server.nix { };
+       openvino-model-server = pkgs.callPackage ./nix/openvino-model-server.nix {
+         inherit openvino openvino-genai;
+       };
      in
     {
       packages.${system} = {
@@ -102,6 +104,8 @@
         openvino-genai = openvino-genai;
         openvino-tokenizers = openvino-tokenizers;
         openvino-model-server = openvino-model-server;
+        # Fixed-output fetch phase (bazel external repositories), buildable standalone.
+        openvino-model-server-deps = openvino-model-server.deps;
       };
 
       devShells.${system}.default = pkgs.mkShell {

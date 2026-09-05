@@ -1,0 +1,15 @@
+--- a/src/http_frontend/multi_part_parser_drogon_impl.cpp
++++ b/src/http_frontend/multi_part_parser_drogon_impl.cpp
+@@ -34,8 +34,8 @@
+ std::vector<std::string> DrogonMultiPartParser::getArrayFieldByName(const std::string &name) const {
+-    const auto& paramsVector = this->parser->getParametersVector();
+-    auto it = paramsVector.find(name);
+-    if (it == paramsVector.end()) {
++    const auto &params = this->parser->getParameters();
++    auto it = params.find(name);
++    if (it == params.end()) {
+         return {};
+     }
+-    return it->second;
++    return { it->second };
+ }

@@ -1,0 +1,37 @@
+--- a/mediapipe/framework/port/build_config.bzl
++++ b/mediapipe/framework/port/build_config.bzl
+@@ -3,12 +3,15 @@
+ 
+ """.bzl file for mediapipe open source build configs."""
+ 
+-load("@npm//@bazel/typescript:index.bzl", "ts_project")
+ load(
+     "//mediapipe/framework/tool:mediapipe_proto.bzl",
+     _mediapipe_cc_proto_library = "mediapipe_cc_proto_library",
+     _mediapipe_proto_library = "mediapipe_proto_library",
+ )
++
++def ts_project(name, **kwargs):
++    fail("ts_project is not supported in the Nix/OVMS build")
++
+ 
+ # TODO: enable def_rewrite once alias proto sources are generated.
+ def mediapipe_proto_library(def_rewrite = False, **kwargs):
+
+--- a/mediapipe/framework/tool/mediapipe_proto.bzl
++++ b/mediapipe/framework/tool/mediapipe_proto.bzl
+@@ -6,10 +6,13 @@
+ load("//mediapipe/framework/tool:mediapipe_proto_allowlist.bzl", "rewrite_target_list")
+ load("@com_google_protobuf//:protobuf.bzl", "cc_proto_library", "py_proto_library")
+ load("@rules_proto//proto:defs.bzl", _proto_library = "proto_library")
+-load("@rules_proto_grpc//js:defs.bzl", "js_proto_library")
+ 
+ java_proto_library = native.java_proto_library
+ java_lite_proto_library = native.java_lite_proto_library
++
++def js_proto_library(name, **kwargs):
++    fail("js_proto_library is not supported in the Nix/OVMS build")
++
+ 
+ def provided_args(**kwargs):
+     """Returns the keyword arguments omitting None arguments."""

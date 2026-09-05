@@ -1,0 +1,17 @@
+--- a/src/pull_module/libgit2.cpp
++++ b/src/pull_module/libgit2.cpp
+@@ -68,6 +68,14 @@
+ extern "C" {
+ OVMS_LIBGIT2_LFS_IMPORT void git_lfs_cancel_set(int value);
+ OVMS_LIBGIT2_LFS_IMPORT int git_lfs_cancel_get(void);
+ }
++
++// The nix-provided libgit2 is not built with OVMS's LFS-cancellation patch,
++// so these accessors would otherwise be undefined at link time. Keep in-process
++// flags so the symbols resolve and clone cancellation degrades gracefully.
++#include <atomic>
++static std::atomic<int> g_lfsCancel{0};
++extern "C" void git_lfs_cancel_set(int value) { g_lfsCancel = value != 0 ? 1 : 0; }
++extern "C" int git_lfs_cancel_get(void) { return g_lfsCancel; }
+ 
+ namespace ovms {

@@ -1,0 +1,26 @@
+--- a/src/drogon_http_async_writer_impl.cpp
++++ b/src/drogon_http_async_writer_impl.cpp
+@@ -31,5 +31,5 @@
+     if (firstResponse) {
+         firstResponse = false;
+         this->responsePtr->setCustomStatusCode(int(status));
+-        this->stream->sendHeader(this->responsePtr->renderHeaderToString());
++        // stock drogon auto-sends the header (with custom status) on first send()
+     }
+@@ -88,15 +88,9 @@
+     if (auto connPtr = weakConnPtr.lock()) {
+-        // Get the original callback set by TcpServer (does connSet_.erase())
+-        auto originalCallback = connPtr->getCloseCallback();
+-        connPtr->setCloseCallback([originalCallback, onDisconnectedCallback = std::move(onDisconnectedCallback)](const trantor::TcpConnectionPtr& conn) {
+-            // Run original callback first to ensure proper cleanup
+-            if (originalCallback) {
+-                originalCallback(conn);
+-            }
+-
++        // drogon/trantor expose no getCloseCallback(); install our own.
++        connPtr->setCloseCallback([onDisconnectedCallback = std::move(onDisconnectedCallback)](const trantor::TcpConnectionPtr&) {
+             // Run custom callback to stop ongoing processing
+             if (onDisconnectedCallback) {
+                 onDisconnectedCallback();
+             }
+         });

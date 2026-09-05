@@ -1,0 +1,8 @@
+--- a/third_party/openvino/BUILD
++++ b/third_party/openvino/BUILD
+@@ -28,6 +28,6 @@
+     name = "openvino_new_headers",
+     hdrs = glob([
+-        "include/openvino/**/*.*"
++        "include/**/*.*"
+     ]),
