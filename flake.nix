@@ -1,5 +1,5 @@
 {
-  description = "openvino-server: OpenAI-compatible image generation server for OpenVINO GenAI (Qwen-Image) on Drogon";
+  description = "openvino-server: OpenAI-compatible image/text generation server for OpenVINO GenAI on Drogon";
 
   inputs = {
     nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
@@ -66,46 +66,13 @@
         };
         patches = [ ./nix/openvino-tokenizers-use-system-pcre2-and-sentencepiece-binary-dir.patch ];
       });
-
-      openvino-python = pkgs.python3Packages.openvino.override { openvino-native = openvino; };
-      openvino-genai-python = pkgs.python3Packages.openvino-genai.override { openvino-tokenizers = openvino-tokenizers-python; openvino-genai-native = openvino-genai; };
-       openvino-tokenizers-python = pkgs.python3Packages.openvino-tokenizers.override { openvino = openvino-python; openvino-tokenizers-native = openvino-tokenizers; };
-
-       # OVMS v2026.3.1 built against our custom OpenVINO stack
-       openvino-model-server = pkgs.callPackage ./nix/openvino-model-server.nix {
-         inherit openvino openvino-genai openvino-tokenizers;
-       };
-     in
+    in
     {
       packages.${system} = {
-        # Quick test with nixpkgs cached packages.
-        # NOTE: Qwen-Image support is not available in nixpkgs openvino-genai (2026.2.0.0).
-        default-test-pkgs = pkgs.callPackage ./nix/server.nix {
-          openvino = pkgs.openvino;
-          openvino-genai = pkgs.openvino-genai;
-          openvino-tokenizers = pkgs.openvino-tokenizers;
-          openvino-genai-dev = pkgs.openvino-genai.dev;
-        };
-        # GPU model loading test using nixpkgs openvino-genai Python bindings.
-        gpu-test = let python = pkgs.python3.withPackages (ps: [ openvino-python openvino-genai-python ]); in pkgs.writeShellApplication {
-          name = "gpu-test";
-          runtimeInputs = [
-            python
-          ];
-          text = ''
-            exec ${python}/bin/python3 ${./tools/gpu_test.py} "$@"
-          '';
-        };
-        # Local build (from GitHub master):
         default = pkgs.callPackage ./nix/server.nix {
-          inherit (pkgs) openvino openvino-genai openvino-tokenizers;
+          inherit openvino openvino-genai openvino-tokenizers;
         };
-        inherit openvino;
-        openvino-genai = openvino-genai;
-        openvino-tokenizers = openvino-tokenizers;
-        openvino-model-server = openvino-model-server;
-        # Fixed-output fetch phase (bazel external repositories), buildable standalone.
-        openvino-model-server-deps = openvino-model-server.deps;
+        inherit openvino openvino-genai openvino-tokenizers;
       };
 
       devShells.${system}.default = pkgs.mkShell {
@@ -122,9 +89,10 @@
         ];
 
         shellHook = ''
-          export OpenVINOGenAI_DIR="${pkgs.openvino-genai.dev}/lib/cmake/OpenVINOGenAI"
+          export OpenVINOGenAI_DIR="${pkgs.openvino-genai.dev}/lib/cmake"
+          export nlohmann_json_DIR="${pkgs.nlohmann_json}/lib/cmake/nlohmann_json"
           export Drogon_DIR="${pkgs.drogon}/lib/cmake/Drogon"
-          export OpenVINO_DIR="${pkgs.openvino}/runtime/cmake"
+          export OpenVINO_DIR="${pkgs.openvino.dev}/lib/cmake"
           export CMAKE_PREFIX_PATH="${pkgs.openvino-genai.dev}:${pkgs.nlohmann_json}:${pkgs.drogon}:${pkgs.openvino}/runtime"
           # genai dlopens libopenvino_tokenizers.so (see tokenizer/tokenizers_path.cpp).
           export OPENVINO_TOKENIZERS_PATH_GENAI="${pkgs.openvino-tokenizers}/lib/libopenvino_tokenizers.so"
@@ -132,7 +100,7 @@
           echo "openvino-server dev shell ready."
           echo "  cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release"
           echo "  cmake --build build"
-          echo "  ./build/openvino-server --model /path/to/qwen-image"
+          echo "  ./build/openvino-server --txt2img /path/to/qwen-image"
         '';
       };
     };

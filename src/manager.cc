@@ -12,48 +12,48 @@ ModelManager& ModelManager::instance() {
     return mgr;
 }
 
-void ModelManager::load(const std::string& id, const ModelSpec& spec) {
+void ModelManager::load_image(const std::string& id,
+                              const ImageGenerationSpec& spec) {
     std::lock_guard lock(m_mutex);
-    if (m_models.find(id) != m_models.end()) {
-        throw std::runtime_error("model '" + id + "' already loaded");
+    if (m_image_models.find(id) != m_image_models.end()) {
+        throw std::runtime_error("image model '" + id + "' already loaded");
     }
-    auto model = std::make_shared<Model>(id, spec.path, spec.device,
-                                         spec.properties,
-                                         spec.text_encoder_device,
-                                         spec.transformer_device,
-                                         spec.vae_device,
-                                         spec.static_shapes,
-                                         spec.naive);
-    m_models.emplace(id, std::move(model));
+    auto model = std::make_shared<ImageGenerationModel>(id, spec.path, spec.device);
+    m_image_models.emplace(id, std::move(model));
 }
 
-Model* ModelManager::get(const std::string& id) const {
+ImageGenerationModel* ModelManager::get_image(const std::string& id) const {
     std::lock_guard lock(m_mutex);
-    auto it = m_models.find(id);
-    if (it == m_models.end()) {
+    auto it = m_image_models.find(id);
+    if (it == m_image_models.end()) {
         return nullptr;
     }
     return it->second.get();
 }
 
-void ModelManager::load_vlm(const std::string& id, const VLMModelSpec& spec) {
+void ModelManager::load_text(const std::string& id,
+                             const TextGenerationSpec& spec) {
     std::lock_guard lock(m_mutex);
-    if (m_vlms.find(id) != m_vlms.end()) {
-        throw std::runtime_error("vlm model '" + id + "' already loaded");
+    if (m_text_models.find(id) != m_text_models.end()) {
+        throw std::runtime_error("text model '" + id + "' already loaded");
     }
-    auto model = std::make_shared<VLMModel>(id, spec.path, spec.device,
-                                            spec.properties, spec.scheduler,
-                                            spec.rest_workers);
-    m_vlms.emplace(id, std::move(model));
+    auto model = std::make_shared<TextGenerationModel>(id, spec.path, spec.device);
+    m_text_models.emplace(id, std::move(model));
 }
 
-VLMModel* ModelManager::get_vlm(const std::string& id) const {
+TextGenerationModel* ModelManager::get_text(const std::string& id) const {
     std::lock_guard lock(m_mutex);
-    auto it = m_vlms.find(id);
-    if (it == m_vlms.end()) {
+    auto it = m_text_models.find(id);
+    if (it == m_text_models.end()) {
         return nullptr;
     }
     return it->second.get();
+}
+
+void ModelManager::shutdown() {
+    std::lock_guard lock(m_mutex);
+    m_image_models.clear();
+    m_text_models.clear();
 }
 
 }  // namespace ovserver

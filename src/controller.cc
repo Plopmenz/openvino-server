@@ -21,8 +21,8 @@
 #include "ovserver/image.hpp"
 #include "ovserver/image_decode.hpp"
 #include "ovserver/manager.hpp"
-#include "ovserver/model.hpp"
-#include "ovserver/vlm_model.hpp"
+#include "ovserver/image_generation.hpp"
+#include "ovserver/text_generation.hpp"
 
 namespace ovserver {
 namespace {
@@ -203,7 +203,7 @@ void registerModels(drogon::HttpAppFramework& app) {
                            std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
                             (void)req;
                             Json::Value arr = Json::arrayValue;
-                            const auto& models = ModelManager::instance().all();
+                            const auto& models = ModelManager::instance().all_images();
                             for (const auto& entry : models) {
                                 Json::Value m;
                                 m["id"] = entry.first;
@@ -212,8 +212,9 @@ void registerModels(drogon::HttpAppFramework& app) {
                                 m["owned_by"] = "openvino-genai";
                                 arr.append(m);
                             }
-                            const auto& vlms = ModelManager::instance().all_vlms();
-                            for (const auto& entry : vlms) {
+                            const auto& text_models =
+                                ModelManager::instance().all_text();
+                            for (const auto& entry : text_models) {
                                 Json::Value m;
                                 m["id"] = entry.first;
                                 m["object"] = "model";
@@ -249,25 +250,25 @@ void registerImageGenerations(drogon::HttpAppFramework& app) {
 
             try {
                 const std::string prompt = getString(body, "prompt");
-                Model* model = nullptr;
+                ImageGenerationModel* model = nullptr;
 
                 if (!body.isMember("model")) {
-                    auto& models = ModelManager::instance().all();
+                    auto& models = ModelManager::instance().all_images();
                     if (models.size() == 1) {
                         model = models.begin()->second.get();
                     }
                 } else if (body["model"].isString()) {
-                    model = ModelManager::instance().get(body["model"].asString());
+                    model = ModelManager::instance().get_image(body["model"].asString());
                 }
                 if (!model) {
                     callback(error_response(
                         "The requested model is not available. Start the server "
-                        "with --model or provide a valid 'model' field.",
+                        "with --txt2img or provide a valid 'model' field.",
                         drogon::k404NotFound));
                     return;
                 }
 
-                GenerateOptions opts;
+                ImageGenerateOptions opts;
                 opts.prompt = prompt;
                 if (body.isMember("negative_prompt") && body["negative_prompt"].isString()) {
                     opts.negative_prompt = body["negative_prompt"].asString();
@@ -446,26 +447,26 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
             }
 
             try {
-                VLMModel* model = nullptr;
+                TextGenerationModel* model = nullptr;
                 if (body.isMember("model") && body["model"].isString()) {
-                    model = ModelManager::instance().get_vlm(body["model"].asString());
+                    model = ModelManager::instance().get_text(body["model"].asString());
                 }
                 if (!model) {
-                    auto& vlms = ModelManager::instance().all_vlms();
-                    if (vlms.size() == 1) {
-                        model = vlms.begin()->second.get();
+                    auto& text_models = ModelManager::instance().all_text();
+                    if (text_models.size() == 1) {
+                        model = text_models.begin()->second.get();
                     }
                 }
                 if (!model) {
                     callback(error_response(
-                        "The requested VLM model is not available. Start the "
-                        "server with --vlm-model or provide a valid 'model' field.",
+                        "The requested text model is not available. Start the "
+                        "server with --txt2txt or provide a valid 'model' field.",
                         drogon::k404NotFound));
                     return;
                 }
 
                 ParsedChat chat = parse_messages(body["messages"]);
-                VLMGenerateOptions opts;
+                TextGenerateOptions opts;
                 opts.prompt = chat.prompt;
                 opts.system_message = chat.system_message;
                 opts.images = std::move(chat.images);
@@ -547,7 +548,7 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                                         return ok;
                                     };
 
-                                VLMGenerateOptions gen = opts;
+                                TextGenerateOptions gen = opts;
                                 gen.on_text =
                                     [send_chunk](std::string word) {
                                         return send_chunk(std::move(word));
@@ -579,7 +580,7 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                                     try {
                                         model->generate(gen);
                                     } catch (const std::exception& e) {
-                                        std::cerr << "vlm streaming error: "
+                                        std::cerr << "text streaming error: "
                                                   << e.what() << std::endl;
                                     }
                                     finish();
@@ -602,7 +603,7 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                 pool().enqueue([model, opts, model_name, req_id, callback] {
                     drogon::HttpResponsePtr resp;
                     try {
-                        VLMResult result = model->generate(opts);
+                        TextResult result = model->generate(opts);
                         Json::Value out;
                         out["id"] = req_id;
                         out["object"] = "chat.completion";

@@ -8,8 +8,8 @@
 #include <string>
 #include <unordered_map>
 
-#include "ovserver/model.hpp"
-#include "ovserver/vlm_model.hpp"
+#include "ovserver/image_generation.hpp"
+#include "ovserver/text_generation.hpp"
 
 namespace ovserver {
 
@@ -17,25 +17,33 @@ class ModelManager {
 public:
     static ModelManager& instance();
 
-    void load(const std::string& id, const ModelSpec& spec);
-    Model* get(const std::string& id) const;
+    void load_image(const std::string& id, const ImageGenerationSpec& spec);
+    ImageGenerationModel* get_image(const std::string& id) const;
 
-    void load_vlm(const std::string& id, const VLMModelSpec& spec);
-    VLMModel* get_vlm(const std::string& id) const;
+    void load_text(const std::string& id, const TextGenerationSpec& spec);
+    TextGenerationModel* get_text(const std::string& id) const;
 
-    const std::unordered_map<std::string, std::shared_ptr<Model>>& all() const {
-        return m_models;
+    // Releases all loaded models. Called explicitly on shutdown so genai/OV
+    // objects are destroyed while the process and OpenVINO plugins are still
+    // fully initialized (teardown during C++ static destruction segfaults).
+    void shutdown();
+
+    const std::unordered_map<std::string, std::shared_ptr<ImageGenerationModel>>&
+    all_images() const {
+        return m_image_models;
     }
 
-    const std::unordered_map<std::string, std::shared_ptr<VLMModel>>&
-    all_vlms() const {
-        return m_vlms;
+    const std::unordered_map<std::string, std::shared_ptr<TextGenerationModel>>&
+    all_text() const {
+        return m_text_models;
     }
 
 private:
     mutable std::mutex m_mutex;
-    std::unordered_map<std::string, std::shared_ptr<Model>> m_models;
-    std::unordered_map<std::string, std::shared_ptr<VLMModel>> m_vlms;
+    std::unordered_map<std::string, std::shared_ptr<ImageGenerationModel>>
+        m_image_models;
+    std::unordered_map<std::string, std::shared_ptr<TextGenerationModel>>
+        m_text_models;
 };
 
 }  // namespace ovserver
