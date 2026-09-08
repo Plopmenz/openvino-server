@@ -6,11 +6,16 @@
 #include <json/json.h>
 
 #include <algorithm>
+#include <cctype>
 #include <condition_variable>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <future>
+#include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -18,11 +23,14 @@
 #include <thread>
 #include <vector>
 
+#include "ovserver/audio.hpp"
+#include "ovserver/base64.hpp"
 #include "ovserver/image.hpp"
 #include "ovserver/image_decode.hpp"
 #include "ovserver/manager.hpp"
 #include "ovserver/image_generation.hpp"
 #include "ovserver/text_generation.hpp"
+#include "ovserver/video_generation.hpp"
 
 namespace ovserver {
 namespace {
@@ -47,6 +55,60 @@ bool getInt64(const Json::Value& obj, const char* key, int64_t& out) {
     }
     out = obj[key].asInt64();
     return true;
+}
+
+// Converts a (sub)tree of the request JSON into the genai JsonContainer used by
+// ChatHistory / chat templates.
+ov::genai::JsonContainer json_to_genai(const Json::Value& v) {
+    Json::StreamWriterBuilder builder;
+    builder["indentation"] = "";
+    builder["commentStyle"] = "None";
+    return ov::genai::JsonContainer::from_json_string(
+        Json::writeString(builder, v));
+}
+
+// OpenAI "response_format" -> structured output constraint.
+//   {"type": "json_schema", "json_schema": {"schema": {...}, ...}}
+//   {"type": "json_object"}                          (any JSON object)
+//   {"type": "text"} or absent                       (unconstrained)
+std::optional<ov::genai::StructuredOutputConfig> parse_response_format(
+    const Json::Value& body) {
+    if (!body.isMember("response_format") || body["response_format"].isNull()) {
+        return std::nullopt;
+    }
+    const Json::Value& rf = body["response_format"];
+    if (!rf.isObject() || !rf.isMember("type") || !rf["type"].isString()) {
+        throw std::runtime_error(
+            "'response_format' must be an object with a string 'type'");
+    }
+    const std::string type = rf["type"].asString();
+    if (type == "text") {
+        return std::nullopt;
+    }
+    std::string schema;
+    if (type == "json_object") {
+        // OpenAI "json_object": valid JSON object output. Constrain with a
+        // JSON Schema that accepts any object.
+        schema = R"({"type": "object", "properties": {}, "required": []})";
+    } else if (type == "json_schema") {
+        if (!rf.isMember("json_schema") || !rf["json_schema"].isObject() ||
+            !rf["json_schema"].isMember("schema") ||
+            !rf["json_schema"]["schema"].isObject()) {
+            throw std::runtime_error(
+                "'response_format' of type \"json_schema\" requires a "
+                "\"json_schema.schema\" JSON object");
+        }
+        Json::StreamWriterBuilder builder;
+        builder["indentation"] = "";
+        builder["commentStyle"] = "None";
+        schema = Json::writeString(builder, rf["json_schema"]["schema"]);
+    } else {
+        throw std::runtime_error(
+            "'response_format.type' must be \"text\", \"json_object\" or "
+            "\"json_schema\"");
+    }
+    return ov::genai::StructuredOutputConfig(
+        ov::AnyMap{{ov::genai::json_schema(schema)}});
 }
 
 drogon::HttpResponsePtr json_response(const Json::Value& body,
@@ -76,6 +138,14 @@ drogon::HttpResponsePtr error_response(std::string message,
 drogon::HttpResponsePtr internal_error_response(const std::exception& e) {
     return error_response("Failed to generate image: " + std::string(e.what()),
                           drogon::k500InternalServerError);
+}
+
+drogon::HttpResponsePtr bytes_response(std::string body,
+                                       drogon::ContentType type) {
+    auto resp = drogon::HttpResponse::newHttpResponse();
+    resp->setContentTypeCode(type);
+    resp->setBody(std::move(body));
+    return resp;
 }
 
 // A bounded worker pool that serialises generation through one pipeline at a
@@ -164,7 +234,9 @@ Json::Value chat_chunk(const std::string& id, const Json::Value& delta,
     chunk["model"] = Json::nullValue;  // filled in by caller
     Json::Value choice;
     choice["index"] = 0;
-    choice["delta"] = delta;
+    // delta must always serialize as an object ({...}), never null, or clients
+    // like vllm crash on choices[0]["delta"].get("content").
+    choice["delta"] = delta.isObject() ? delta : Json::Value(Json::objectValue);
     if (!finish_reason.empty()) {
         choice["finish_reason"] = finish_reason;
     } else {
@@ -176,12 +248,15 @@ Json::Value chat_chunk(const std::string& id, const Json::Value& delta,
     return chunk;
 }
 
-// Extracts the full decoded text and image tensors from an OpenAI-style
-// "messages" array. Content may be a plain string or an array of typed parts
-// ({type:"text",text:...} and {type:"image_url",image_url:{url:"..."}}).
+// Extracts the full conversation and image tensors from an OpenAI-style
+// "messages" array. Every message is preserved (system/user/assistant/tool
+// roles, assistant tool_calls, tool tool_call_id). Content may be a plain
+// string or an array of typed parts ({type:"text",text:...} and
+// {type:"image_url",image_url:{url:"..."}}); image_url parts are decoded into
+// out.images and contribute no text (matching the pipeline's separate-image
+// input path).
 struct ParsedChat {
-    std::string prompt;
-    std::string system_message;
+    std::vector<ov::genai::JsonContainer> messages;
     std::vector<ov::Tensor> images;
 };
 
@@ -215,6 +290,36 @@ void registerModels(drogon::HttpAppFramework& app) {
                             const auto& text_models =
                                 ModelManager::instance().all_text();
                             for (const auto& entry : text_models) {
+                                Json::Value m;
+                                m["id"] = entry.first;
+                                m["object"] = "model";
+                                m["created"] = 0;
+                                m["owned_by"] = "openvino-genai";
+                                arr.append(m);
+                            }
+                            const auto& video_models =
+                                ModelManager::instance().all_video();
+                            for (const auto& entry : video_models) {
+                                Json::Value m;
+                                m["id"] = entry.first;
+                                m["object"] = "model";
+                                m["created"] = 0;
+                                m["owned_by"] = "openvino-genai";
+                                arr.append(m);
+                            }
+                            const auto& asr_models =
+                                ModelManager::instance().all_asr();
+                            for (const auto& entry : asr_models) {
+                                Json::Value m;
+                                m["id"] = entry.first;
+                                m["object"] = "model";
+                                m["created"] = 0;
+                                m["owned_by"] = "openvino-genai";
+                                arr.append(m);
+                            }
+                            const auto& tts_models =
+                                ModelManager::instance().all_tts();
+                            for (const auto& entry : tts_models) {
                                 Json::Value m;
                                 m["id"] = entry.first;
                                 m["object"] = "model";
@@ -317,10 +422,38 @@ void registerImageGenerations(drogon::HttpAppFramework& app) {
                 }
 
                 try {
-                    const bool save = body.isMember("output_dir") &&
-                                      body["output_dir"].isString();
+                    // OpenAI "response_format": "b64_json" (default) returns
+                    // base64 in the response; "url" writes a PNG and returns its
+                    // file path, which requires an "output_dir" to write into.
+                    // "output_format" only supports "png".
+                    const bool has_output_dir = body.isMember("output_dir") &&
+                                               body["output_dir"].isString();
+                    const bool want_url =
+                        body.isMember("response_format") &&
+                        body["response_format"].isString() &&
+                        body["response_format"].asString() == "url";
+                    if (body.isMember("response_format") &&
+                        body["response_format"].isString() &&
+                        !body["response_format"].isNull() &&
+                        body["response_format"].asString() != "b64_json" &&
+                        body["response_format"].asString() != "url") {
+                        throw std::runtime_error(
+                            "'response_format' must be \"b64_json\" or \"url\"");
+                    }
+                    if (body.isMember("output_format") &&
+                        body["output_format"].isString() &&
+                        body["output_format"].asString() != "png") {
+                        throw std::runtime_error(
+                            "'output_format' only supports \"png\"");
+                    }
+                    const bool save = want_url || has_output_dir;
                     std::string output_dir;
                     if (save) {
+                        if (!has_output_dir) {
+                            throw std::runtime_error(
+                                "'response_format' \"url\" requires an "
+                                "'output_dir' to write files into");
+                        }
                         output_dir = body["output_dir"].asString();
                     }
 
@@ -378,53 +511,83 @@ void registerImageGenerations(drogon::HttpAppFramework& app) {
         {drogon::Post});
 }
 
-// Parses the message array into text + images. OpenAI-compatible content blocks
-// ("text" and "image_url") are supported.
+// Parses the message array into a full OpenAI-shaped conversation history.
 ParsedChat parse_messages(const Json::Value& messages) {
     ParsedChat out;
     if (!messages.isArray()) {
         throw std::runtime_error("'messages' must be an array");
     }
-    std::string user_text;
     for (const auto& msg : messages) {
         if (!msg.isMember("role") || !msg["role"].isString()) {
             throw std::runtime_error("each message requires a 'role'");
         }
         const std::string role = msg["role"].asString();
-        if (!msg.isMember("content")) {
-            continue;
+        if (role != "system" && role != "user" && role != "assistant" &&
+            role != "tool") {
+            throw std::runtime_error(
+                "unsupported message role '" + role + "'");
         }
-        const Json::Value& content = msg["content"];
-        std::string text;
-        if (content.isString()) {
-            text = content.asString();
-        } else if (content.isArray()) {
-            for (const auto& part : content) {
-                if (!part.isMember("type") || !part["type"].isString()) {
-                    continue;
-                }
-                const std::string type = part["type"].asString();
-                if (type == "text") {
-                    text += part["text"].asString();
-                } else if (type == "image_url") {
-                    if (!part.isMember("image_url")) {
+
+        Json::Value gen_msg;
+        gen_msg["role"] = role;
+        // "content": string | array of typed parts | null (assistant tool_calls).
+        if (msg.isMember("content") && !msg["content"].isNull()) {
+            const Json::Value& content = msg["content"];
+            std::string text;
+            if (content.isString()) {
+                text = content.asString();
+            } else if (content.isArray()) {
+                for (const auto& part : content) {
+                    if (!part.isMember("type") || !part["type"].isString()) {
                         continue;
                     }
-                    const Json::Value& iu = part["image_url"];
-                    if (iu.isMember("url") && iu["url"].isString()) {
-                        out.images.push_back(
-                            decode_image_base64(iu["url"].asString()));
+                    const std::string type = part["type"].asString();
+                    if (type == "text") {
+                        text += part.get("text", Json::Value()).asString();
+                    } else if (type == "image_url") {
+                        if (!part.isMember("image_url")) {
+                            continue;
+                        }
+                        const Json::Value& iu = part["image_url"];
+                        if (iu.isMember("url") && iu["url"].isString()) {
+                            out.images.push_back(
+                                decode_image_base64(iu["url"].asString()));
+                        }
                     }
                 }
+            } else {
+                throw std::runtime_error(
+                    "message 'content' must be a string or an array of parts");
             }
+            gen_msg["content"] = text;
+        } else {
+            gen_msg["content"] = "";
         }
-        if (role == "system") {
-            out.system_message += text;
-        } else if (role == "user") {
-            user_text += text;
+
+        if (role == "assistant") {
+            // Preserve any tool_calls this assistant turn contains so multi-turn
+            // function-calling conversations survive through the chat template.
+            if (msg.isMember("tool_calls")) {
+                if (!msg["tool_calls"].isArray()) {
+                    throw std::runtime_error(
+                        "assistant 'tool_calls' must be an array");
+                }
+                gen_msg["tool_calls"] = msg["tool_calls"];
+            }
+        } else if (role == "tool") {
+            if (!msg.isMember("tool_call_id") ||
+                !msg["tool_call_id"].isString()) {
+                throw std::runtime_error(
+                    "tool message requires a string 'tool_call_id'");
+            }
+            gen_msg["tool_call_id"] = msg["tool_call_id"].asString();
         }
+
+        out.messages.push_back(json_to_genai(gen_msg));
     }
-    out.prompt = user_text;
+    if (out.messages.empty()) {
+        throw std::runtime_error("'messages' must not be empty");
+    }
     return out;
 }
 
@@ -467,12 +630,24 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
 
                 ParsedChat chat = parse_messages(body["messages"]);
                 TextGenerateOptions opts;
-                opts.prompt = chat.prompt;
-                opts.system_message = chat.system_message;
+                opts.chat_messages = std::move(chat.messages);
                 opts.images = std::move(chat.images);
                 if (body.isMember("max_tokens") && body["max_tokens"].isIntegral()) {
                     opts.max_new_tokens = static_cast<std::size_t>(
                         std::max<int64_t>(1, body["max_tokens"].asInt64()));
+                }
+                // OpenAI renamed max_tokens to max_completion_tokens for recent
+                // models; at most one may be supplied.
+                if (body.isMember("max_completion_tokens") &&
+                    body["max_completion_tokens"].isIntegral()) {
+                    if (body.isMember("max_tokens") &&
+                        body["max_tokens"].isIntegral()) {
+                        throw std::runtime_error(
+                            "provide either 'max_tokens' or "
+                            "'max_completion_tokens', not both");
+                    }
+                    opts.max_new_tokens = static_cast<std::size_t>(std::max<int64_t>(
+                        1, body["max_completion_tokens"].asInt64()));
                 }
                 if (body.isMember("temperature") && body["temperature"].isNumeric()) {
                     opts.temperature =
@@ -485,17 +660,144 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                     opts.top_k = static_cast<std::size_t>(
                         std::max<int64_t>(1, body["top_k"].asInt64()));
                 }
+                // "stop": single string or array of strings.
+                if (body.isMember("stop") && !body["stop"].isNull()) {
+                    Json::Value stop_set = Json::arrayValue;
+                    if (body["stop"].isString()) {
+                        stop_set.append(body["stop"]);
+                    } else if (body["stop"].isArray()) {
+                        for (const auto& s : body["stop"]) {
+                            if (!s.isString()) {
+                                throw std::runtime_error(
+                                    "'stop' must be a string or an array of "
+                                    "strings");
+                            }
+                            stop_set.append(s);
+                        }
+                    } else {
+                        throw std::runtime_error(
+                            "'stop' must be a string or an array of strings");
+                    }
+                    for (const auto& s : stop_set) {
+                        if (!s.asString().empty()) {
+                            opts.stop_strings.insert(s.asString());
+                        }
+                    }
+                }
+                // OpenAI penalties are defined in [-2, 2].
+                if (body.isMember("frequency_penalty") &&
+                    body["frequency_penalty"].isNumeric()) {
+                    opts.frequency_penalty = std::clamp(
+                        static_cast<float>(body["frequency_penalty"].asDouble()),
+                        -2.0f, 2.0f);
+                }
+                if (body.isMember("presence_penalty") &&
+                    body["presence_penalty"].isNumeric()) {
+                    opts.presence_penalty = std::clamp(
+                        static_cast<float>(body["presence_penalty"].asDouble()),
+                        -2.0f, 2.0f);
+                }
                 if (body.isMember("seed") && body["seed"].isIntegral()) {
                     opts.rng_seed = static_cast<std::size_t>(
                         std::max<int64_t>(0, body["seed"].asInt64()));
                 }
+                // OpenAI "tools" (function calling). Definitions are injected
+                // into the model's own chat template; "tool_choice" only
+                // controls whether they are injected at all (and optionally
+                // narrows to one function):
+                //   "none"    -> tools are not injected; no tool parsing.
+                //   "auto"    -> model decides (default).
+                //   "required"-> model is encouraged to call a tool.
+                //   {function:{name}} -> only that function is offered.
+                if (body.isMember("tools")) {
+                    if (!body["tools"].isArray()) {
+                        throw std::runtime_error("'tools' must be an array");
+                    }
+                    bool none = false;
+                    std::optional<std::string> forced_name;
+                    if (body.isMember("tool_choice") &&
+                        !body["tool_choice"].isNull()) {
+                        const Json::Value& tc = body["tool_choice"];
+                        if (tc.isString()) {
+                            const std::string s = tc.asString();
+                            if (s == "none") {
+                                none = true;
+                            } else if (s != "auto" && s != "required") {
+                                throw std::runtime_error(
+                                    "'tool_choice' must be \"none\", \"auto\", "
+                                    "\"required\" or a function object");
+                            }
+                        } else if (tc.isObject()) {
+                            if (!tc.isMember("function") ||
+                                !tc["function"].isObject() ||
+                                !tc["function"].isMember("name") ||
+                                !tc["function"]["name"].isString()) {
+                                throw std::runtime_error(
+                                    "'tool_choice' function object must have "
+                                    "function.name");
+                            }
+                            forced_name = tc["function"]["name"].asString();
+                        } else {
+                            throw std::runtime_error(
+                                "'tool_choice' must be a string or a function "
+                                "object");
+                        }
+                    }
+                    if (!none && !body["tools"].empty()) {
+                        Json::Value tools = body["tools"];
+                        if (forced_name) {
+                            Json::Value filtered = Json::arrayValue;
+                            for (auto& t : tools) {
+                                if (t.isMember("function") &&
+                                    t["function"].isMember("name") &&
+                                    t["function"]["name"].isString() &&
+                                    t["function"]["name"].asString() ==
+                                        *forced_name) {
+                                    filtered.append(t);
+                                }
+                            }
+                            if (filtered.empty()) {
+                                throw std::runtime_error(
+                                    "tool_choice names a function that is not "
+                                    "in 'tools'");
+                            }
+                            tools = filtered;
+                        }
+                        opts.tools = json_to_genai(tools);
+                    }
+                }
+                // Number of independent completions to sample. Streaming several
+                // concurrent generations in one SSE stream is not supported.
+                std::size_t n_choices = 1;
+                if (body.isMember("n") && body["n"].isIntegral()) {
+                    n_choices = static_cast<std::size_t>(
+                        std::clamp<int64_t>(body["n"].asInt64(), 1, 10));
+                }
+                // OpenAI "response_format" -> structured output (xgrammar
+                // backend): constrain output to a JSON schema.
+                opts.structured_output = parse_response_format(body);
+                // stream_options.include_usage: emit a final usage-only chunk.
+                const bool stream_usage = body.isMember("stream_options") &&
+                                          body["stream_options"].isObject() &&
+                                          body["stream_options"]
+                                              .isMember("include_usage") &&
+                                          body["stream_options"]["include_usage"]
+                                              .isBool() &&
+                                          body["stream_options"]["include_usage"]
+                                              .asBool();
 
                 const std::string model_name = model->id();
                 const std::string req_id = "chatcmpl-" + std::to_string(std::time(nullptr));
 
+                // Streaming several concurrent generations in one SSE stream is
+                // not supported.
                 const bool do_stream = body.isMember("stream") &&
                                        body["stream"].isBool() &&
                                        body["stream"].asBool();
+                if (do_stream && n_choices > 1) {
+                    throw std::runtime_error(
+                        "'stream' with 'n' > 1 is not supported");
+                }
 
                 if (do_stream) {
                     // SSE: chunked transfer. Generation runs on a worker thread;
@@ -517,22 +819,20 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                     drogon::HttpResponsePtr resp =
                         drogon::HttpResponse::newAsyncStreamResponse(
                             [state, model, opts = std::move(opts), shared_id,
-                             shared_model,
-                             req_id](drogon::ResponseStreamPtr stream) {
+                             shared_model, req_id,
+                             stream_usage](drogon::ResponseStreamPtr stream) {
                                 state->stream.reset(stream.release());
 
-                                // Sends one content fragment as an SSE chunk.
-                                // Returns false if the client is gone.
-                                auto send_chunk =
+                                // Sends one chunk carrying `delta`. Returns
+                                // false if the client is gone.
+                                auto send_delta =
                                     [state, shared_id, shared_model](
-                                        std::string word) {
+                                        Json::Value delta) {
                                         std::lock_guard lock(state->mutex);
                                         auto s = state->stream;
                                         if (!s) {
                                             return false;
                                         }
-                                        Json::Value delta;
-                                        delta["content"] = std::move(word);
                                         Json::Value chunk = chat_chunk(
                                             *shared_id, delta, "");
                                         chunk["model"] = *shared_model;
@@ -549,46 +849,146 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                                     };
 
                                 TextGenerateOptions gen = opts;
+                                auto toolbuf = std::make_shared<std::string>();
+                                auto in_tool = std::make_shared<bool>(false);
+                                const std::string tool_open = "<tool_call>";
+                                const std::string tool_close = "</tool_call>";
                                 gen.on_text =
-                                    [send_chunk](std::string word) {
-                                        return send_chunk(std::move(word));
-                                    };
-
-                                // Sends the trailing finish_reason + [DONE] and
-                                // closes the stream.
-                                auto finish =
-                                    [state, shared_id, shared_model]() {
-                                        std::lock_guard lock(state->mutex);
-                                        if (!state->stream) {
-                                            return;
+                                    [send_delta, toolbuf, in_tool, tool_open,
+                                     tool_close](std::string word) {
+                                        if (*in_tool) {
+                                            *toolbuf += word;
+                                            const auto c = toolbuf->find(
+                                                tool_close);
+                                            if (c == std::string::npos) {
+                                                return true;
+                                            }
+                                            toolbuf->erase(0,
+                                                           c + tool_close.size());
+                                            *in_tool = false;
+                                            if (toolbuf->empty()) {
+                                                return true;
+                                            }
+                                            word = std::move(*toolbuf);
+                                            toolbuf->clear();
+                                        } else {
+                                            const auto o = word.find(tool_open);
+                                            if (o != std::string::npos) {
+                                                if (o > 0) {
+                                                    Json::Value delta;
+                                                    delta["content"] =
+                                                        word.substr(0, o);
+                                                    if (!send_delta(
+                                                            std::move(delta))) {
+                                                        return false;
+                                                    }
+                                                }
+                                                *in_tool = true;
+                                                toolbuf->clear();
+                                                toolbuf->append(word.substr(o));
+                                                return true;
+                                            }
+                                        }
+                                        if (word.empty()) {
+                                            return true;
                                         }
                                         Json::Value delta;
-                                        Json::Value chunk = chat_chunk(
-                                            *shared_id, delta, "stop");
-                                        chunk["model"] = *shared_model;
-                                        Json::StreamWriterBuilder b;
-                                        b["indentation"] = "";
-                                        state->stream->send(sse_message(
-                                            Json::writeString(b, chunk)));
-                                        state->stream->send(
-                                            sse_message("[DONE]"));
-                                        state->stream->close();
-                                        state->stream.reset();
+                                        delta["content"] = std::move(word);
+                                        return send_delta(std::move(delta));
+                                    };
+                                gen.on_reasoning =
+                                    [send_delta](std::string word) {
+                                        Json::Value delta;
+                                        delta["reasoning_content"] =
+                                            std::move(word);
+                                        return send_delta(std::move(delta));
                                     };
 
+                                // Sends the trailing finish_reason (+ usage when
+                                // requested) and [DONE], then closes the stream.
+                                auto finish = [state, shared_id, shared_model,
+                                               stream_usage](
+                                                  const TextResult& r) {
+                                    std::lock_guard lock(state->mutex);
+                                    if (!state->stream) {
+                                        return;
+                                    }
+                                    Json::StreamWriterBuilder b;
+                                    b["indentation"] = "";
+                                    Json::Value delta;
+                                    if (!r.tool_calls.empty()) {
+                                        // Function calls are only fully known
+                                        // once generation ends, so they arrive
+                                        // with arguments pre-assembled in the
+                                        // final chunk alongside
+                                        // finish_reason="tool_calls".
+                                        Json::Value tcs = Json::arrayValue;
+                                        for (std::size_t i = 0;
+                                             i < r.tool_calls.size(); ++i) {
+                                            const auto& tc = r.tool_calls[i];
+                                            Json::Value item;
+                                            item["index"] = static_cast<int>(i);
+                                            item["id"] = tc.id;
+                                            item["type"] = "function";
+                                            item["function"]["name"] = tc.name;
+                                            item["function"]["arguments"] =
+                                                tc.arguments;
+                                            tcs.append(item);
+                                        }
+                                        delta["content"] = Json::nullValue;
+                                        delta["tool_calls"] = tcs;
+                                    }
+                                    Json::Value chunk = chat_chunk(
+                                        *shared_id, delta,
+                                        r.finish_reason.empty()
+                                            ? "stop"
+                                            : r.finish_reason);
+                                    chunk["model"] = *shared_model;
+                                    state->stream->send(sse_message(
+                                        Json::writeString(b, chunk)));
+                                    if (stream_usage) {
+                                        Json::Value usage;
+                                        usage["prompt_tokens"] =
+                                            static_cast<int64_t>(r.prompt_tokens);
+                                        usage["completion_tokens"] =
+                                            static_cast<int64_t>(
+                                                r.completion_tokens);
+                                        usage["total_tokens"] =
+                                            static_cast<int64_t>(
+                                                r.prompt_tokens +
+                                                r.completion_tokens);
+                                        Json::Value frame;
+                                        frame["id"] = *shared_id;
+                                        frame["object"] =
+                                            "chat.completion.chunk";
+                                        frame["created"] = static_cast<int>(
+                                            std::time(nullptr));
+                                        frame["model"] = *shared_model;
+                                        frame["choices"] = Json::arrayValue;
+                                        frame["usage"] = usage;
+                                        state->stream->send(sse_message(
+                                            Json::writeString(b, frame)));
+                                    }
+                                    state->stream->send(
+                                        sse_message("[DONE]"));
+                                    state->stream->close();
+                                    state->stream.reset();
+                                };
+
                                 auto worker = [state, gen, model, finish] {
+                                    TextResult result;
                                     try {
-                                        model->generate(gen);
+                                        result = model->generate(gen);
                                     } catch (const std::exception& e) {
                                         std::cerr << "text streaming error: "
                                                   << e.what() << std::endl;
                                     }
-                                    finish();
+                                    finish(result);
                                 };
                                 try {
                                     pool().enqueue(worker);
                                 } catch (const std::exception& e) {
-                                    finish();
+                                    finish(TextResult{});
                                 }
                             },
                             true /*disableKickoffTimeout*/);
@@ -599,33 +999,71 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                     return;
                 }
 
-                // Non-streaming: full response in one shot.
-                pool().enqueue([model, opts, model_name, req_id, callback] {
+                // Non-streaming: full response in one shot. With "n" > 1 the prompt is
+                // sampled multiple times and the seeds are varied per completed
+                // so distinct generations come back (a user-supplied seed is
+                // still reproduced per choice via a fixed offset).
+                pool().enqueue([model, opts, model_name, req_id, callback,
+                                n_choices] {
                     drogon::HttpResponsePtr resp;
                     try {
-                        TextResult result = model->generate(opts);
+                        Json::Value choices = Json::arrayValue;
+                        Json::Value usage;
+                        int64_t p_tokens = 0, c_tokens = 0;
+                        const std::size_t seed_base =
+                            opts.rng_seed
+                                ? *opts.rng_seed
+                                : static_cast<std::size_t>(std::time(nullptr));
+                        for (std::size_t i = 0; i < n_choices; ++i) {
+                            TextGenerateOptions gen = opts;
+                            if (n_choices > 1) {
+                                gen.rng_seed = seed_base + i;
+                            }
+                            TextResult result = model->generate(gen);
+                            Json::Value msg;
+                            msg["role"] = "assistant";
+                            if (!result.tool_calls.empty()) {
+                                // OpenAI: content is null when tool_calls are
+                                // returned; arguments are a JSON string.
+                                msg["content"] = Json::nullValue;
+                                Json::Value tcs = Json::arrayValue;
+                                for (const auto& tc : result.tool_calls) {
+                                    Json::Value item;
+                                    item["id"] = tc.id;
+                                    item["type"] = "function";
+                                    item["function"]["name"] = tc.name;
+                                    item["function"]["arguments"] = tc.arguments;
+                                    tcs.append(item);
+                                }
+                                msg["tool_calls"] = tcs;
+                            } else {
+                                msg["content"] = result.text;
+                            }
+                            if (!result.reasoning_content.empty()) {
+                                msg["reasoning_content"] =
+                                    result.reasoning_content;
+                            }
+                            Json::Value choice;
+                            choice["index"] = static_cast<int>(i);
+                            choice["message"] = msg;
+                            choice["finish_reason"] =
+                                result.finish_reason.empty()
+                                    ? Json::Value("stop")
+                                    : Json::Value(result.finish_reason);
+                            choices.append(choice);
+                            p_tokens += static_cast<int64_t>(result.prompt_tokens);
+                            c_tokens +=
+                                static_cast<int64_t>(result.completion_tokens);
+                        }
                         Json::Value out;
                         out["id"] = req_id;
                         out["object"] = "chat.completion";
                         out["created"] = static_cast<int>(std::time(nullptr));
                         out["model"] = model_name;
-                        Json::Value msg;
-                        msg["role"] = "assistant";
-                        msg["content"] = result.text;
-                        Json::Value choice;
-                        choice["index"] = 0;
-                        choice["message"] = msg;
-                        choice["finish_reason"] =
-                            result.finish_reason.empty()
-                                ? Json::Value("stop")
-                                : Json::Value(result.finish_reason);
-                        Json::Value choices = Json::arrayValue;
-                        choices.append(choice);
                         out["choices"] = choices;
-                        Json::Value usage;
-                        usage["prompt_tokens"] = 0;
-                        usage["completion_tokens"] = 0;
-                        usage["total_tokens"] = 0;
+                        usage["prompt_tokens"] = p_tokens;
+                        usage["completion_tokens"] = c_tokens;
+                        usage["total_tokens"] = p_tokens + c_tokens;
                         out["usage"] = usage;
                         resp = json_response(out);
                     } catch (const std::exception& e) {
@@ -645,10 +1083,585 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
 
 }  // namespace
 
+void registerVideoGenerations(drogon::HttpAppFramework& app) {
+    app.registerHandler(
+        "/v1/video/generations",
+        [](const drogon::HttpRequestPtr& req,
+           std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+            Json::CharReaderBuilder reader;
+            reader["failIfExtra"] = false;
+            auto body_view = req->getBody();
+            std::istringstream stream(std::string(body_view.begin(), body_view.end()));
+            Json::Value body;
+            std::string errs;
+            if (!Json::parseFromStream(reader, stream, &body, &errs) ||
+                !body.isObject()) {
+                callback(error_response("Invalid JSON request body: " + errs,
+                                        drogon::k400BadRequest));
+                return;
+            }
+
+            try {
+                const std::string prompt = getString(body, "prompt");
+                VideoGenerationModel* model = nullptr;
+
+                if (!body.isMember("model")) {
+                    auto& models = ModelManager::instance().all_video();
+                    if (models.size() == 1) {
+                        model = models.begin()->second.get();
+                    }
+                } else if (body["model"].isString()) {
+                    model = ModelManager::instance().get_video(body["model"].asString());
+                }
+                if (!model) {
+                    callback(error_response(
+                        "The requested video model is not available. Start the "
+                        "server with --txt2vid or provide a valid 'model' field.",
+                        drogon::k404NotFound));
+                    return;
+                }
+
+                VideoGenerateOptions opts;
+                opts.prompt = prompt;
+                if (body.isMember("negative_prompt") &&
+                    body["negative_prompt"].isString()) {
+                    opts.negative_prompt = body["negative_prompt"].asString();
+                }
+                if (body.isMember("guidance_scale") &&
+                    body["guidance_scale"].isNumeric()) {
+                    opts.guidance_scale =
+                        static_cast<float>(body["guidance_scale"].asDouble());
+                }
+                if (body.isMember("steps") && body["steps"].isIntegral()) {
+                    opts.num_inference_steps = static_cast<std::size_t>(
+                        std::max<int64_t>(1, body["steps"].asInt64()));
+                }
+                if (body.isMember("seed") && body["seed"].isIntegral()) {
+                    opts.rng_seed = static_cast<std::size_t>(
+                        std::max<int64_t>(0, body["seed"].asInt64()));
+                }
+                if (body.isMember("n") && body["n"].isIntegral()) {
+                    opts.num_videos = static_cast<std::size_t>(
+                        std::clamp<int64_t>(body["n"].asInt64(), 1, 4));
+                }
+                if (body.isMember("num_frames") && body["num_frames"].isIntegral()) {
+                    opts.num_frames = static_cast<std::size_t>(std::max<int64_t>(
+                        1, body["num_frames"].asInt64()));
+                }
+                float fps = 25.0f;
+                if (body.isMember("fps") && body["fps"].isNumeric()) {
+                    fps = static_cast<float>(body["fps"].asDouble());
+                    if (fps > 0) opts.frame_rate = fps;
+                }
+                if (!opts.num_frames && body.isMember("duration") &&
+                    body["duration"].isNumeric()) {
+                    opts.num_frames = static_cast<std::size_t>(std::max(
+                        1.0, body["duration"].asDouble() * fps));
+                }
+
+                auto snap16 = [](int64_t v) {
+                    const int64_t step = 16;
+                    const int64_t lo = 64, hi = 4096;
+                    v = std::max(lo, std::min(hi, (v + step / 2) / step * step));
+                    return v;
+                };
+                if (body.isMember("size") && body["size"].isString()) {
+                    std::string size = body["size"].asString();
+                    auto x = size.find('x');
+                    if (x == std::string::npos) {
+                        throw std::runtime_error(
+                            "'size' must be formatted as \"WxH\", e.g. \"1024x576\"");
+                    }
+                    opts.width = snap16(std::stoll(size.substr(0, x)));
+                    opts.height = snap16(std::stoll(size.substr(x + 1)));
+                } else {
+                    int64_t w = 0, h = 0;
+                    getInt64(body, "width", w);
+                    getInt64(body, "height", h);
+                    if (w > 0) opts.width = snap16(w);
+                    if (h > 0) opts.height = snap16(h);
+                }
+
+                try {
+                    const bool has_output_dir = body.isMember("output_dir") &&
+                                               body["output_dir"].isString();
+                    const bool want_url =
+                        body.isMember("response_format") &&
+                        body["response_format"].isString() &&
+                        body["response_format"].asString() == "url";
+                    if (body.isMember("response_format") &&
+                        body["response_format"].isString() &&
+                        body["response_format"].asString() != "b64_json" &&
+                        body["response_format"].asString() != "url") {
+                        throw std::runtime_error(
+                            "'response_format' must be \"b64_json\" or \"url\"");
+                    }
+                    if (body.isMember("output_format") &&
+                        body["output_format"].isString() &&
+                        body["output_format"].asString() != "mp4") {
+                        throw std::runtime_error(
+                            "'output_format' only supports \"mp4\"");
+                    }
+                    const bool save = want_url || has_output_dir;
+                    std::string output_dir;
+                    if (save) {
+                        if (!has_output_dir) {
+                            throw std::runtime_error(
+                                "'response_format' \"url\" requires an "
+                                "'output_dir' to write files into");
+                        }
+                        output_dir = body["output_dir"].asString();
+                    }
+
+                    pool().enqueue([model, opts, save, output_dir, callback] {
+                        drogon::HttpResponsePtr resp;
+                        try {
+                            auto results = model->generate(opts);
+
+                            Json::Value data = Json::arrayValue;
+                            for (std::size_t i = 0; i < results.size(); ++i) {
+                                const auto& video = results[i];
+                                Json::Value item;
+                                if (!save) {
+                                    const std::filesystem::path tmp =
+                                        std::filesystem::temp_directory_path() /
+                                        ("ovserver_vid_" +
+                                         std::to_string(std::time(nullptr)) +
+                                         "_" + std::to_string(i) + ".mp4");
+                                    if (!write_video_mp4(tmp.string(), video)) {
+                                        throw std::runtime_error(
+                                            "encoding MP4 failed (is ffmpeg on "
+                                            "PATH?)");
+                                    }
+                                    std::ifstream fin(
+                                        tmp, std::ios::binary);
+                                    std::string bytes(
+                                        (std::istreambuf_iterator<char>(fin)),
+                                        std::istreambuf_iterator<char>());
+                                    fin.close();
+                                    std::filesystem::remove(tmp);
+                                    item["b64_json"] = base64_encode(
+                                        reinterpret_cast<const std::uint8_t*>(
+                                            bytes.data()),
+                                        bytes.size());
+                                    item["url"] = Json::nullValue;
+                                } else {
+                                    const std::string path =
+                                        output_dir + "/" + "ovserver_" +
+                                        std::to_string(std::time(nullptr)) + "_" +
+                                        std::to_string(i) + ".mp4";
+                                    if (!write_video_mp4(path, video)) {
+                                        throw std::runtime_error(
+                                            "cannot write MP4 to " + path);
+                                    }
+                                    item["b64_json"] = Json::nullValue;
+                                    item["url"] = path;
+                                }
+                                data.append(item);
+                            }
+                            Json::Value out;
+                            out["created"] = static_cast<int>(std::time(nullptr));
+                            out["data"] = data;
+                            resp = json_response(out);
+                        } catch (const std::exception& e) {
+                            resp = internal_error_response(e);
+                        }
+                        callback(resp);
+                    });
+                } catch (const std::exception& e) {
+                    callback(internal_error_response(e));
+                }
+            } catch (const std::exception& e) {
+                callback(error_response(e.what(), drogon::k400BadRequest));
+            }
+        },
+        {drogon::Post});
+}
+
+void registerAudioTranscriptions(drogon::HttpAppFramework& app) {
+    app.registerHandler(
+        "/v1/audio/transcriptions",
+        [](const drogon::HttpRequestPtr& req,
+           std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+            drogon::MultiPartParser parser;
+            const int parse_status = parser.parse(req);
+            if (parse_status != 0) {
+                callback(error_response(
+                    "multipart/form-data upload is required",
+                    drogon::k400BadRequest));
+                return;
+            }
+            const auto& files = parser.getFiles();
+            if (files.empty()) {
+                callback(error_response(
+                    "a 'file' field with the audio to transcribe is required",
+                    drogon::k400BadRequest));
+                return;
+            }
+
+            try {
+                ASRModel* model = nullptr;
+                const auto& params = parser.getParameters();
+                auto model_it = params.find("model");
+                const std::string requested =
+                    model_it == params.end() ? std::string{} : model_it->second;
+                if (requested.empty()) {
+                    auto& models = ModelManager::instance().all_asr();
+                    if (models.size() == 1) {
+                        model = models.begin()->second.get();
+                    }
+                } else {
+                    model = ModelManager::instance().get_asr(requested);
+                }
+                if (!model) {
+                    callback(error_response(
+                        "The requested ASR model is not available. Start the "
+                        "server with --wav2txt or provide a valid 'model' "
+                        "field.",
+                        drogon::k404NotFound));
+                    return;
+                }
+
+                ASRGenerateOptions opts;
+                auto lang_it = params.find("language");
+                if (lang_it != params.end()) {
+                    opts.language = lang_it->second;
+                }
+                auto prompt_it = params.find("prompt");
+                if (prompt_it != params.end()) {
+                    opts.initial_prompt = prompt_it->second;
+                }
+                auto temp_it = params.find("temperature");
+                if (temp_it != params.end()) {
+                    try {
+                        opts.temperature =
+                            static_cast<float>(std::stod(temp_it->second));
+                    } catch (const std::exception&) {
+                        // ignore malformed temperature
+                    }
+                }
+                auto rfmt_it = params.find("response_format");
+                const std::string response_format =
+                    rfmt_it == params.end() ? std::string{} : rfmt_it->second;
+                if (!response_format.empty() &&
+                    response_format != "json" && response_format != "text" &&
+                    response_format != "verbose_json") {
+                    callback(error_response(
+                        "'response_format' must be \"json\", \"text\" or "
+                        "\"verbose_json\"",
+                        drogon::k400BadRequest));
+                    return;
+                }
+                auto as_bool = [](const std::string& v) {
+                    std::string low;
+                    low.reserve(v.size());
+                    for (char c : v)
+                        low.push_back(
+                            static_cast<char>(std::tolower(
+                                static_cast<unsigned char>(c))));
+                    return low == "1" || low == "true" || low == "on" ||
+                           low == "yes";
+                };
+                auto stream_it = params.find("stream");
+                const bool stream =
+                    stream_it != params.end() && as_bool(stream_it->second);
+                if (stream && !response_format.empty() &&
+                    response_format != "json" && response_format != "text") {
+                    callback(error_response(
+                        "stream=true supports only 'response_format' \"json\" "
+                        "or \"text\"",
+                        drogon::k400BadRequest));
+                    return;
+                }
+                auto tg_it = params.find("timestamp_granularities");
+                if (tg_it != params.end()) {
+                    const std::string& tg = tg_it->second;
+                    if (tg.find("word") != std::string::npos) {
+                        callback(error_response(
+                            "word-level timestamps are not supported; use \"segment\"",
+                            drogon::k400BadRequest));
+                        return;
+                    }
+                    if (tg.find("segment") != std::string::npos) {
+                        opts.return_timestamps = true;
+                    }
+                }
+
+                auto file_content = files.front().fileContent();
+                const std::string audio_bytes =
+                    file_content.empty()
+                        ? std::string{}
+                        : std::string(file_content.data(),
+                                      file_content.size());
+
+                const std::string model_name =
+                    requested.empty() ? model->id() : requested;
+
+                if (stream) {
+                    // Degrades to the SGLang-style SSE transcript stream that
+                    // vLLM/llama.cpp-family clients also consume:
+                    //   data: {"type":"transcript.text.delta","delta":...}
+                    //   data: {"type":"transcript.text.done","text":...,"usage":...}
+                    //   data: [DONE]
+                    struct StreamState {
+                        std::shared_ptr<drogon::ResponseStream> stream;
+                        std::mutex mutex;
+                    };
+                    auto state = std::make_shared<StreamState>();
+                    drogon::HttpResponsePtr resp =
+                        drogon::HttpResponse::newAsyncStreamResponse(
+                            [state, model, opts, audio_bytes](
+                                drogon::ResponseStreamPtr stream) {
+                                state->stream.reset(stream.release());
+
+                                // Sends one JSON payload as an SSE frame.
+                                // Returns false if the client is gone.
+                                auto send_event =
+                                    [state](const std::string& payload) {
+                                        std::lock_guard lock(state->mutex);
+                                        auto s = state->stream;
+                                        if (!s) {
+                                            return false;
+                                        }
+                                        const bool ok =
+                                            s->send(sse_message(payload));
+                                        if (!ok) {
+                                            state->stream.reset();
+                                        }
+                                        return ok;
+                                    };
+
+                                auto worker =
+                                    [state, model, opts, audio_bytes,
+                                     send_event]() mutable {
+                                        ASRResult result;
+                                        try {
+                                            opts.samples =
+                                                decode_audio_to_f32(audio_bytes);
+                                            const std::size_t duration_s =
+                                                (opts.samples.size() + 15999) /
+                                                16000;
+                                            ASROnText on_text =
+                                                [send_event](
+                                                    const std::string& delta) {
+                                                    Json::StreamWriterBuilder b;
+                                                    b["indentation"] = "";
+                                                    Json::Value ev;
+                                                    ev["type"] =
+                                                        "transcript.text.delta";
+                                                    ev["delta"] = delta;
+                                                    const bool ok = send_event(
+                                                        Json::writeString(
+                                                            b, ev));
+                                                    return ok
+                                                               ? ov::genai::
+                                                                     StreamingStatus::
+                                                                         RUNNING
+                                                               : ov::genai::
+                                                                     StreamingStatus::
+                                                                         STOP;
+                                                };
+                                            result =
+                                                model->generate(opts, on_text);
+
+                                            Json::StreamWriterBuilder b;
+                                            b["indentation"] = "";
+                                            Json::Value done;
+                                            done["type"] =
+                                                "transcript.text.done";
+                                            done["text"] = result.text;
+                                            if (duration_s > 0) {
+                                                Json::Value usage;
+                                                usage["type"] = "duration";
+                                                usage["seconds"] = static_cast<
+                                                    int64_t>(duration_s);
+                                                done["usage"] = usage;
+                                            }
+                                            send_event(
+                                                Json::writeString(b, done));
+                                            send_event("[DONE]");
+                                        } catch (const std::exception& e) {
+                                            Json::StreamWriterBuilder b;
+                                            b["indentation"] = "";
+                                            Json::Value err;
+                                            err["type"] = "error";
+                                            Json::Value msg;
+                                            msg["message"] =
+                                                "Failed to transcribe audio: " +
+                                                std::string(e.what());
+                                            err["error"] = msg;
+                                            send_event(
+                                                Json::writeString(b, err));
+                                        }
+                                        std::lock_guard lock(state->mutex);
+                                        if (state->stream) {
+                                            state->stream->close();
+                                            state->stream.reset();
+                                        }
+                                    };
+                                try {
+                                    pool().enqueue(worker);
+                                } catch (const std::exception& e) {
+                                    Json::StreamWriterBuilder b;
+                                    b["indentation"] = "";
+                                    Json::Value err;
+                                    err["type"] = "error";
+                                    Json::Value msg;
+                                    msg["message"] =
+                                        "Failed to transcribe audio: " +
+                                        std::string(e.what());
+                                    err["error"] = msg;
+                                    send_event(Json::writeString(b, err));
+                                    std::lock_guard lock(state->mutex);
+                                    if (state->stream) {
+                                        state->stream->close();
+                                        state->stream.reset();
+                                    }
+                                }
+                            },
+                            true /*disableKickoffTimeout*/);
+                    resp->setContentTypeString("text/event-stream");
+                    resp->addHeader("Cache-Control", "no-cache");
+                    resp->addHeader("Connection", "keep-alive");
+                    callback(resp);
+                    return;
+                }
+
+                pool().enqueue([model, opts, audio_bytes, response_format,
+                                model_name, callback]() mutable {
+                    drogon::HttpResponsePtr resp;
+                    try {
+                        opts.samples = decode_audio_to_f32(audio_bytes);
+                        ASRResult result = model->generate(opts);
+
+                        if (response_format == "text") {
+                            resp = bytes_response(result.text,
+                                                  drogon::CT_TEXT_PLAIN);
+                        } else if (response_format == "verbose_json") {
+                            Json::Value segs = Json::arrayValue;
+                            const double duration =
+                                static_cast<double>(opts.samples.size()) /
+                                16000.0;
+                            for (std::size_t i = 0; i < result.segments.size();
+                                 ++i) {
+                                Json::Value s;
+                                s["id"] = static_cast<int>(i);
+                                s["start"] = result.segments[i].start;
+                                s["end"] = result.segments[i].end;
+                                s["text"] = result.segments[i].text;
+                                segs.append(s);
+                            }
+                            Json::Value out;
+                            out["task"] = "transcribe";
+                            out["language"] = result.language;
+                            out["duration"] = duration;
+                            out["text"] = result.text;
+                            out["segments"] = segs;
+                            resp = json_response(out);
+                        } else {
+                            Json::Value out;
+                            out["text"] = result.text;
+                            resp = json_response(out);
+                        }
+                    } catch (const std::exception& e) {
+                        resp = error_response(
+                            "Failed to transcribe audio: " +
+                                std::string(e.what()),
+                            drogon::k500InternalServerError);
+                    }
+                    callback(resp);
+                });
+            } catch (const std::exception& e) {
+                callback(error_response(e.what(), drogon::k400BadRequest));
+            }
+        },
+        {drogon::Post});
+}
+
+void registerAudioSpeech(drogon::HttpAppFramework& app) {
+    app.registerHandler(
+        "/v1/audio/speech",
+        [](const drogon::HttpRequestPtr& req,
+           std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+            Json::CharReaderBuilder reader;
+            reader["failIfExtra"] = false;
+            auto body_view = req->getBody();
+            std::istringstream stream(std::string(body_view.begin(), body_view.end()));
+            Json::Value body;
+            std::string errs;
+            if (!Json::parseFromStream(reader, stream, &body, &errs) ||
+                !body.isObject()) {
+                callback(error_response("Invalid JSON request body: " + errs,
+                                        drogon::k400BadRequest));
+                return;
+            }
+
+            try {
+                const std::string text = getString(body, "input");
+                TTSModel* model = nullptr;
+                if (!body.isMember("model")) {
+                    auto& models = ModelManager::instance().all_tts();
+                    if (models.size() == 1) {
+                        model = models.begin()->second.get();
+                    }
+                } else if (body["model"].isString()) {
+                    model = ModelManager::instance().get_tts(body["model"].asString());
+                }
+                if (!model) {
+                    callback(error_response(
+                        "The requested TTS model is not available. Start the "
+                        "server with --txt2wav or provide a valid 'model' field.",
+                        drogon::k404NotFound));
+                    return;
+                }
+
+                std::string response_format = "wav";
+                if (body.isMember("response_format") &&
+                    body["response_format"].isString()) {
+                    response_format = body["response_format"].asString();
+                }
+                if (response_format != "wav" && response_format != "pcm") {
+                    callback(error_response(
+                        "'response_format' must be \"wav\" or \"pcm\"",
+                        drogon::k400BadRequest));
+                    return;
+                }
+
+                pool().enqueue([model, text, response_format, callback] {
+                    drogon::HttpResponsePtr resp;
+                    try {
+                        TTSResult result = model->generate(text);
+                        std::vector<std::uint8_t> raw =
+                            wav_pcm16(result.samples, result.sample_rate);
+                        resp = bytes_response(
+                            std::string(
+                                reinterpret_cast<const char*>(raw.data()),
+                                raw.size()),
+                            response_format == "wav"
+                                ? drogon::CT_AUDIO_WAVE
+                                : drogon::CT_APPLICATION_OCTET_STREAM);
+                    } catch (const std::exception& e) {
+                        resp = error_response(
+                            "Failed to generate speech: " +
+                                std::string(e.what()),
+                            drogon::k500InternalServerError);
+                    }
+                    callback(resp);
+                });
+            } catch (const std::exception& e) {
+                callback(error_response(e.what(), drogon::k400BadRequest));
+            }
+        },
+        {drogon::Post});
+}
+
 void register_api_handlers(drogon::HttpAppFramework& app) {
     registerHealth(app);
     registerModels(app);
     registerImageGenerations(app);
+    registerVideoGenerations(app);
+    registerAudioTranscriptions(app);
+    registerAudioSpeech(app);
     registerChatCompletions(app);
 }
 

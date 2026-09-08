@@ -5,11 +5,13 @@
   makeWrapper,
   cmake,
   ninja,
+  ffmpeg,
   nlohmann_json,
   openvino,
   openvino-tokenizers,
   openvino-genai,
   drogon,
+  addDriverRunpath,
 }: # nixpkgs installs .so files directly under lib/ and CMake config under
    # lib/cmake/OpenVINOGenAI/. This mirrors that layout.
 stdenv.mkDerivation (finalAttrs: {
@@ -21,6 +23,7 @@ stdenv.mkDerivation (finalAttrs: {
   nativeBuildInputs =
     [
       autoPatchelfHook
+      addDriverRunpath
       cmake
       makeWrapper
       ninja
@@ -45,10 +48,13 @@ stdenv.mkDerivation (finalAttrs: {
 
   # genai locates libopenvino_tokenizers.so through OPENVINO_TOKENIZERS_PATH_GENAI
   # (dlopen, not DT_NEEDED), so it must be set in the runtime environment.
+  # ffmpeg is invoked as a subprocess by --wav2txt and --txt2vid, so it is
+  # added to PATH rather than linked.
   postInstall = ''
     wrapProgram $out/bin/openvino-server \
       --set OPENVINO_TOKENIZERS_PATH_GENAI \
-      "${openvino-tokenizers}/lib/libopenvino_tokenizers.so"
+      "${openvino-tokenizers}/lib/libopenvino_tokenizers.so" \
+      --prefix PATH : ${ffmpeg}/bin
   '';
 
   meta = {

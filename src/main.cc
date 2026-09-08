@@ -11,6 +11,7 @@
 
 #include <openvino/runtime/core.hpp>
 
+#include "ovserver/audio.hpp"
 #include "ovserver/controller.hpp"
 #include "ovserver/manager.hpp"
 
@@ -36,6 +37,58 @@ void usage(const char* argv0) {
         << "      --txt2txt-id ID     Model id for the corresponding --txt2txt.\n"
         << "                          Default: the directory basename. When multiple\n"
         << "                          text models are given each requires an id.\n"
+        << "      --kv-cache-precision TYPE\n"
+        << "                          KV cache element type for text models on GPU.\n"
+        << "                          Default: u8.\n"
+        << "      --dynamic-quant-gsize N\n"
+        << "                          Dynamic quantization group size for GPU text\n"
+        << "                          inference. Default: 32.\n"
+        << "      --enable-sdpa BOOL   Enable SDPA optimization for GPU text\n"
+        << "                          inference. Default: true.\n"
+        << "      --cache-interval-multiplier N\n"
+        << "                          Linear-attention KV checkpoint interval, in\n"
+        << "                          KV blocks. Ignored by models without linear\n"
+        << "                          attention. Default: 64.\n"
+        << "      --no-prefix-caching Disable KV-block prefix caching (on by\n"
+        << "                          default). Caching retains previously computed\n"
+        << "                          KV blocks for prompt-prefix reuse, improving\n"
+        << "                          TTFT at the cost of VRAM.\n"
+        << "      --prompt-lookup     Enable prompt-lookup speculative decoding.\n"
+        << "                          Uses n-gram matching against the prompt to\n"
+        << "                          draft candidate tokens. No extra model needed.\n"
+        << "      --num-assistant-tokens N\n"
+        << "                          Number of draft tokens proposed per\n"
+        << "                          speculative-decoding step. Default: 5.\n"
+        << "      --max-ngram-size N  Maximum n-gram size for prompt-lookup\n"
+        << "                          matching. Default: 3.\n"
+        << "      --no-mtp            Disable auto-detection of bundled MTP\n"
+        << "                          (Multi-Token Prediction) heads. When a model\n"
+        << "                          directory contains openvino_mtp_model.xml,\n"
+        << "                          MTP speculative decoding is enabled\n"
+        << "                          automatically.\n"
+        << "      --txt2vid PATH      Path to an exported OpenVINO GenAI video\n"
+        << "                          generation model (e.g. LTX-Video). May be\n"
+        << "                          repeated.\n"
+        << "      --txt2vid-id ID     Model id for the corresponding --txt2vid.\n"
+        << "                          Default: the directory basename. When multiple\n"
+        << "                          video models are given each requires an id.\n"
+        << "      --wav2txt PATH      Path to an exported OpenVINO GenAI speech\n"
+        << "                          recognition model (e.g. Qwen3-ASR, Whisper).\n"
+        << "                          May be repeated.\n"
+        << "      --wav2txt-id ID     Model id for the corresponding --wav2txt.\n"
+        << "                          Default: the directory basename. When multiple\n"
+        << "                          ASR models are given each requires an id.\n"
+        << "      --txt2wav PATH      Path to an exported OpenVINO GenAI text-to-\n"
+        << "                          speech model (e.g. SpeechT5, Kokoro). May be\n"
+        << "                          repeated.\n"
+        << "      --txt2wav-id ID     Model id for the corresponding --txt2wav.\n"
+        << "                          Default: the directory basename. When multiple\n"
+        << "                          TTS models are given each requires an id.\n"
+        << "      --ffmpeg PATH       Path to the ffmpeg binary used to decode\n"
+        << "                          uploaded audio and encode generated video.\n"
+        << "                          Default: 'ffmpeg' on PATH. Set to an empty\n"
+        << "                          string to require 16 kHz WAV uploads and skip\n"
+        << "                          MP4 output.\n"
         << "  -d, --device DEVICE     OpenVINO device (CPU, GPU, AUTO, ...).\n"
         << "                          Default: CPU.\n"
         << "  -h, --host HOST         Listen address. Default: 0.0.0.0\n"
@@ -68,6 +121,12 @@ int main(int argc, char** argv) {
     std::vector<std::string> image_model_ids;
     std::vector<std::string> text_models;
     std::vector<std::string> text_model_ids;
+    std::vector<std::string> video_models;
+    std::vector<std::string> video_model_ids;
+    std::vector<std::string> asr_models;
+    std::vector<std::string> asr_model_ids;
+    std::vector<std::string> tts_models;
+    std::vector<std::string> tts_model_ids;
     std::string device = "CPU";
     std::string host = "0.0.0.0";
     int port = 8080;
@@ -75,6 +134,16 @@ int main(int argc, char** argv) {
     std::string log_level = "INFO";
     std::string config_file;
     size_t idle_timeout = 3600;
+    std::string kv_cache_precision = "u8";
+    size_t dynamic_quant_group_size = 32;
+    bool enable_sdpa = true;
+    size_t cache_interval_multiplier = 64;
+    bool enable_prefix_caching = true;
+    bool prompt_lookup = false;
+    size_t num_assistant_tokens = 5;
+    size_t max_ngram_size = 3;
+    bool enable_mtp = true;
+    std::string ffmpeg = "ffmpeg";
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -87,6 +156,20 @@ int main(int argc, char** argv) {
                 text_models.push_back(get_arg(argc, argv, i, a.c_str()));
             } else if (a == "--txt2txt-id") {
                 text_model_ids.push_back(get_arg(argc, argv, i, a.c_str()));
+            } else if (a == "--txt2vid") {
+                video_models.push_back(get_arg(argc, argv, i, a.c_str()));
+            } else if (a == "--txt2vid-id") {
+                video_model_ids.push_back(get_arg(argc, argv, i, a.c_str()));
+            } else if (a == "--wav2txt") {
+                asr_models.push_back(get_arg(argc, argv, i, a.c_str()));
+            } else if (a == "--wav2txt-id") {
+                asr_model_ids.push_back(get_arg(argc, argv, i, a.c_str()));
+            } else if (a == "--txt2wav") {
+                tts_models.push_back(get_arg(argc, argv, i, a.c_str()));
+            } else if (a == "--txt2wav-id") {
+                tts_model_ids.push_back(get_arg(argc, argv, i, a.c_str()));
+            } else if (a == "--ffmpeg") {
+                ffmpeg = get_arg(argc, argv, i, a.c_str());
             } else if (a == "-d" || a == "--device") {
                 device = get_arg(argc, argv, i, a.c_str());
             } else if (a == "-h" || a == "--host") {
@@ -101,6 +184,36 @@ int main(int argc, char** argv) {
                 config_file = get_arg(argc, argv, i, a.c_str());
             } else if (a == "--idle-timeout") {
                 idle_timeout = std::stoul(get_arg(argc, argv, i, a.c_str()));
+            } else if (a == "--kv-cache-precision") {
+                kv_cache_precision = get_arg(argc, argv, i, a.c_str());
+            } else if (a == "--dynamic-quant-gsize") {
+                dynamic_quant_group_size =
+                    std::stoul(get_arg(argc, argv, i, a.c_str()));
+            } else if (a == "--enable-sdpa") {
+                const std::string v = get_arg(argc, argv, i, a.c_str());
+                if (v == "1" || v == "true" || v == "TRUE") {
+                    enable_sdpa = true;
+                } else if (v == "0" || v == "false" || v == "FALSE") {
+                    enable_sdpa = false;
+                } else {
+                    throw std::runtime_error(
+                        "--enable-sdpa expects true or false");
+                }
+            } else if (a == "--cache-interval-multiplier") {
+                cache_interval_multiplier =
+                    std::stoul(get_arg(argc, argv, i, a.c_str()));
+            } else if (a == "--no-prefix-caching") {
+                enable_prefix_caching = false;
+            } else if (a == "--prompt-lookup") {
+                prompt_lookup = true;
+            } else if (a == "--num-assistant-tokens") {
+                num_assistant_tokens =
+                    std::stoul(get_arg(argc, argv, i, a.c_str()));
+            } else if (a == "--max-ngram-size") {
+                max_ngram_size =
+                    std::stoul(get_arg(argc, argv, i, a.c_str()));
+            } else if (a == "--no-mtp") {
+                enable_mtp = false;
             } else if (a == "-v" || a == "--version") {
                 std::cout << "openvino-server 0.1.0\n";
                 return 0;
@@ -117,8 +230,10 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    if (image_models.empty() && text_models.empty()) {
-        std::cerr << "error: at least one --txt2img or --txt2txt PATH is required\n";
+    if (image_models.empty() && text_models.empty() && video_models.empty() &&
+        asr_models.empty() && tts_models.empty()) {
+        std::cerr << "error: at least one of --txt2img, --txt2txt, --txt2vid, "
+                     "--wav2txt or --txt2wav PATH is required\n";
         usage(argv[0]);
         return 2;
     }
@@ -138,6 +253,32 @@ int main(int argc, char** argv) {
         std::cerr << "error: --txt2txt-id given but no --txt2txt\n";
         return 2;
     }
+    if (!video_model_ids.empty() && video_model_ids.size() != video_models.size()) {
+        std::cerr << "error: --txt2vid-id must be supplied for every --txt2vid\n";
+        return 2;
+    }
+    if (video_models.empty() && !video_model_ids.empty()) {
+        std::cerr << "error: --txt2vid-id given but no --txt2vid\n";
+        return 2;
+    }
+    if (!asr_model_ids.empty() && asr_model_ids.size() != asr_models.size()) {
+        std::cerr << "error: --wav2txt-id must be supplied for every --wav2txt\n";
+        return 2;
+    }
+    if (asr_models.empty() && !asr_model_ids.empty()) {
+        std::cerr << "error: --wav2txt-id given but no --wav2txt\n";
+        return 2;
+    }
+    if (!tts_model_ids.empty() && tts_model_ids.size() != tts_models.size()) {
+        std::cerr << "error: --txt2wav-id must be supplied for every --txt2wav\n";
+        return 2;
+    }
+    if (tts_models.empty() && !tts_model_ids.empty()) {
+        std::cerr << "error: --txt2wav-id given but no --txt2wav\n";
+        return 2;
+    }
+
+    ovserver::set_ffmpeg_path(ffmpeg);
 
     drogon::HttpAppFramework& app = drogon::app();
 
@@ -179,9 +320,49 @@ int main(int argc, char** argv) {
             auto id = text_model_ids.empty() ? p.filename().string()
                                              : text_model_ids[i];
             ovserver::ModelManager::instance().load_text(
-                id, {p, device});
+                id, {p,
+                     device,
+                     kv_cache_precision,
+                     dynamic_quant_group_size,
+                     enable_sdpa,
+                     cache_interval_multiplier,
+                     enable_prefix_caching,
+                     prompt_lookup,
+                     num_assistant_tokens,
+                     max_ngram_size,
+                     enable_mtp});
             LOG_INFO << "Text model '" << id
                      << "' ready at /v1/chat/completions";
+        }
+
+        for (size_t i = 0; i < video_models.size(); ++i) {
+            const std::filesystem::path p(video_models[i]);
+            auto id = video_model_ids.empty() ? p.filename().string()
+                                              : video_model_ids[i];
+            ovserver::ModelManager::instance().load_video(
+                id, {p, device});
+            LOG_INFO << "Video model '" << id
+                     << "' ready at /v1/video/generations";
+        }
+
+        for (size_t i = 0; i < asr_models.size(); ++i) {
+            const std::filesystem::path p(asr_models[i]);
+            auto id = asr_model_ids.empty() ? p.filename().string()
+                                            : asr_model_ids[i];
+            ovserver::ModelManager::instance().load_asr(
+                id, {p, device});
+            LOG_INFO << "ASR model '" << id
+                     << "' ready at /v1/audio/transcriptions";
+        }
+
+        for (size_t i = 0; i < tts_models.size(); ++i) {
+            const std::filesystem::path p(tts_models[i]);
+            auto id = tts_model_ids.empty() ? p.filename().string()
+                                            : tts_model_ids[i];
+            ovserver::ModelManager::instance().load_tts(
+                id, {p, device});
+            LOG_INFO << "TTS model '" << id
+                     << "' ready at /v1/audio/speech";
         }
     } catch (const std::exception& e) {
         std::cerr << "error loading model: " << e.what() << "\n";

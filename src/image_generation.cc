@@ -134,14 +134,14 @@ void ImageGenerationModel::snapshot_run() {
             continue;
         }
         // Only requests that have completed at least one denoising step are
-        // eligible: their average s/step is meaningful.
+        // eligible: average their latest step duration.
         double acc = 0.0;
         std::size_t n = 0;
         for (const auto& [id, s] : m_steps) {
             if (s.steps == 0) {
                 continue;
             }
-            acc += s.step_sum_s / static_cast<double>(s.steps);
+            acc += s.last_step_s;
             ++n;
         }
         if (n == 0) {
@@ -198,7 +198,7 @@ std::vector<ImageResult> ImageGenerationModel::generate(
                 last = now;
                 std::lock_guard<std::mutex> lock(m_metrics_mutex);
                 StepStats& s = m_steps[req_id];
-                s.step_sum_s += step_s;
+                s.last_step_s = step_s;
                 ++s.steps;
                 return false;
             });

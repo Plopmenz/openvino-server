@@ -63,11 +63,12 @@ public:
 private:
     void snapshot_run();
 
-    // Per-request diffusion timing. The pipeline callback appends each step's
-    // duration; the snapshot thread averages them once per second.
+    // Per-request diffusion timing. The pipeline callback records the duration
+    // of the just-completed step; the snapshot thread averages the latest
+    // s/step across running requests once per second.
     struct StepStats {
         std::size_t steps = 0;
-        double step_sum_s = 0.0;
+        double last_step_s = 0.0;
     };
 
     std::string m_id;

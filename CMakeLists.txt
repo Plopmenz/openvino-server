@@ -23,6 +23,8 @@ add_executable(openvino-server
     src/image.cc
     src/image_decode.cc
     src/text_generation.cc
+    src/video_generation.cc
+    src/audio.cc
     src/base64.cc
 )
 

@@ -1,21 +1,26 @@
 # openvino-server
 
-Serve OpenVINO GenAI image-generation and text-generation models over an
-OpenAI-compatible HTTP API using the
-[Drogon](https://github.com/drogonframework/drogon) C++ web framework.
+Serve OpenVINO GenAI image-generation, text-generation, video-generation,
+speech-recognition and text-to-speech models over an OpenAI-compatible HTTP API
+using the [Drogon](https://github.com/drogonframework/drogon) C++ web framework.
 
 Supported models: anything the OpenVINO GenAI `Text2ImagePipeline` (e.g.
-**Qwen-Image**) and `ContinuousBatchingPipeline` (e.g. **Qwen2.5-VL**,
-**Qwen3-VL**) understand, exported to OpenVINO IR.
+**Qwen-Image**), `ContinuousBatchingPipeline` (e.g. **Qwen2.5-VL**,
+**Qwen3-VL**), `Text2VideoPipeline` (e.g. **LTX-Video**), `ASRPipeline` (e.g.
+**Qwen3-ASR**, **Whisper**) and `Text2SpeechPipeline` (e.g. **SpeechT5**,
+**Kokoro**) understand, exported to OpenVINO IR.
 
 ## Endpoints
 
-| Method | Path                       | Purpose                               |
-| ------ | -------------------------- | ------------------------------------- |
-| GET    | `/v1/models`               | List loaded models                    |
-| POST   | `/v1/images/generations`   | Generate image(s) from a text prompt  |
-| POST   | `/v1/chat/completions`     | Text completion (streaming supported) |
-| GET    | `/health`                  | Liveness check                        |
+| Method | Path                       | Purpose                                        |
+| ------ | -------------------------- | ---------------------------------------------- |
+| GET    | `/v1/models`               | List loaded models                             |
+| POST   | `/v1/images/generations`   | Generate image(s) from a text prompt           |
+| POST   | `/v1/video/generations`    | Generate video clip(s) from a text prompt      |
+| POST   | `/v1/audio/transcriptions` | Transcribe an uploaded audio file (multipart)  |
+| POST   | `/v1/audio/speech`         | Synthesize speech (WAV/PCM) from text          |
+| POST   | `/v1/chat/completions`     | Text completion (streaming supported)          |
+| GET    | `/health`                  | Liveness check                                 |
 
 ## Building
 
@@ -71,11 +76,48 @@ Options:
 
 ```
     --txt2img PATH       Path to an exported image-generation model dir
-                         (repeatable; at least one image or text model required)
+                         (repeatable; at least one model required)
     --txt2img-id ID      Model id served as 'model' (default: qwen-image)
     --txt2txt PATH       Path to an exported text-generation model dir
                          (repeatable)
     --txt2txt-id ID      Model id served as 'model' (default: dir basename)
+    --kv-cache-precision TYPE
+                         KV cache element type for text models on GPU
+                         (default: u8)
+    --dynamic-quant-gsize N
+                         Dynamic quantization group size for GPU text
+                         inference (default: 32)
+    --enable-sdpa BOOL   Enable SDPA optimization for GPU text inference
+                         (default: true)
+    --cache-interval-multiplier N
+                         Linear-attention KV checkpoint interval in KV blocks
+                         (default: 64)
+    --no-prefix-caching  Disable KV-block prefix caching (enabled by default).
+                         Caching retains previously computed KV blocks to reuse
+                         shared prompt prefixes across requests (better TTFT).
+    --prompt-lookup      Enable prompt-lookup speculative decoding: draft
+                         candidates by n-gram matching against the prompt. No
+                         extra model needed.
+    --num-assistant-tokens N
+                         Draft tokens proposed per speculative-step (default: 5)
+    --max-ngram-size N   Max n-gram size for prompt-lookup matching (default: 3)
+    --no-mtp             Disable auto-detection of a bundled MTP (Multi-Token
+                         Prediction) head. Models exported with
+                         openvino_mtp_model.xml (e.g. Qwen3.6/3.8) enable MTP
+                         speculative decoding automatically.
+    --txt2vid PATH       Path to an exported video-generation model dir (e.g.
+                         LTX-Video); serves /v1/video/generations (repeatable)
+    --txt2vid-id ID      Model id served as 'model' (default: dir basename)
+    --wav2txt PATH       Path to an exported speech-recognition model dir (e.g.
+                         Qwen3-ASR, Whisper); serves /v1/audio/transcriptions
+                         (repeatable)
+    --wav2txt-id ID      Model id served as 'model' (default: dir basename)
+    --txt2wav PATH       Path to an exported text-to-speech model dir (e.g.
+                         SpeechT5, Kokoro); serves /v1/audio/speech
+                         (repeatable)
+    --txt2wav-id ID      Model id served as 'model' (default: dir basename)
+    --ffmpeg PATH        ffmpeg binary for audio decode / MP4 encode
+                         (default: "ffmpeg" on PATH; empty disables those)
 -d, --device DEVICE      OpenVINO device (default: CPU)
 -h, --host HOST          Listen address (default: 0.0.0.0)
 -p, --port PORT          Listen port (default: 8080)
@@ -165,6 +207,191 @@ Content may be a plain string or an array of `{type:"text"}` /
 `{type:"image_url"}` parts (OpenAI-compatible message content). With
 `"stream": true` the response is a Server-Sent Events stream of
 `chat.completion.chunk` objects.
+
+### Reasoning
+
+For models whose chat template emits thinking markers (e.g. Qwen3's
+` thinking ...  response` or DeepSeek-R1 family), the server automatically
+splits the output: reasoning is returned under `message.reasoning_content`
+(non-streaming) or streamed chunk-by-chunk as `delta.reasoning_content`
+despite `delta.content`, and the markers themselves are never sent. Detection
+is heuristic and keyed off the **chat template**, not the model id; when no
+known markers are found, the raw text is returned unchanged. Nothing is forced:
+whether a model "thinks" follows its own template default (the server does not
+inject an `enable_thinking` option).
+
+### Function calling
+
+OpenAI `tools` and `tool_choice` are supported. Definitions are injected into
+the model's own chat template, and tool calls are parsed out of the response:
+
+```sh
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3",
+    "messages": [
+      { "role": "user", "content": "What is the weather in New York?" }
+    ],
+    "tools": [
+      { "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Current weather for a city",
+          "parameters": {
+            "type": "object",
+            "properties": { "location": { "type": "string" } },
+            "required": ["location"]
+          }
+        } }
+    ],
+    "tool_choice": "auto"
+  }'
+```
+
+### Speculative decoding
+
+Text models transparently benefit from two speed-ups, configured per model at
+startup (not per request):
+
+- **Prefix caching** (on by default): previously computed KV blocks are kept in
+  memory and reused whenever a request shares a prompt prefix with an earlier
+  one. In multi-turn chat (repeated system prompt, growing history) this
+  reduces time-to-first-token significantly. The retained blocks are evicted
+  only when the cache budget is exhausted, so the only cost is VRAM. Disable
+  with `--no-prefix-caching`.
+- **Prompt lookup** (`--prompt-lookup`): drafts candidate tokens by n-gram
+  matching against the prompt, then verifies them in a single forward pass.
+  No second model or extra memory is needed; most effective for input-grounded
+  workloads (RAG, summarization, code editing). Controls:
+  `--num-assistant-tokens N` (default 5) and `--max-ngram-size N` (default 3).
+- **Bundled MTP head** (auto-detected): when a model directory contains
+  `openvino_mtp_model.xml` (how optimum-intel exports Qwen3.6/3.8-family
+  models), MTP speculative decoding is enabled automatically — the model's own
+  Multi-Token-Prediction head drafts several tokens per step. Disable with
+  `--no-mtp`. MTP requires greedy decoding (`temperature` unset) and is
+  mutually exclusive with prompt lookup (prompt lookup wins if both are
+  requested).
+
+The assistant message then contains `tool_calls`
+(`[{id, type, function:{name, arguments}}]` with `arguments` as a JSON string)
+and `finish_reason: "tool_calls"`. The full conversation history holds:
+`tool_choice: "none"` disables injection; `"required"` or a
+`{function:{name}}` object encourages a call (offering only that function);
+`"auto"` (default) lets the model decide. Multi-turn exchanges are supported —
+feed the previous `assistant` message with its `tool_calls`, then a `tool`
+message (`{"role":"tool","content":result,"tool_call_id":id}`), then another
+`user` message.
+
+Tool parsing recognizes the `<tool_call>{...}</tool_call>` (Hermes/Qwen3) and
+bare JSON-object (Llama-3.1) formats. The server does not force a schema for
+tool calls (that is opt-in via `response_format`); if a model family's format
+is not recognized, `tools` are still rendered by the template but `tool_calls`
+are not extracted and the raw text is returned.
+
+### Structured output
+
+OpenAI `response_format` with `json_schema` or `json_object` constrains
+generation so the output matches the requested structure (guided decoding via
+the xgrammar backend):
+
+```sh
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3",
+    "messages": [
+      { "role": "user",
+        "content": "Return the weather for New York as a JSON object." }
+    ],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "weather",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string" },
+            "temp_c": { "type": "number" },
+            "conditions": { "type": "string" }
+          },
+          "required": ["city", "temp_c", "conditions"]
+        }
+      }
+    }
+  }'
+```
+
+`"type": "json_object"` constrains the output to any valid JSON object;
+`"type": "text"` (the default) leaves generation unconstrained. The schema
+follows the JSON Schema subset understood by xgrammar; unsupported constructs
+cause a 400 error at request time.
+
+## Video generation
+
+```sh
+curl http://localhost:8080/v1/video/generations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "ltx-video",
+    "prompt": "a robot walking through a rainy city street at night",
+    "negative_prompt": "blurry, low quality",
+    "guidance_scale": 3.0,
+    "steps": 40,
+    "size": "512x512",
+    "num_frames": 97,
+    "fps": 30,
+    "seed": 42
+  }'
+```
+
+`response_format` defaults to `"b64_json"` (base64-encoded MP4, H.264); set it
+to `"url"` to write MP4s into an `output_dir` and return filesystem paths.
+`n` (1-4) generates multiple clips, `duration` (seconds) is an alternative to
+`num_frames`, and `output_format` accepts only `"mp4"`. Encoding is done by the
+`ffmpeg` binary (see `--ffmpeg`).
+
+## Audio transcription
+
+`/v1/audio/transcriptions` is a multipart/form-data upload, matching the OpenAI
+client:
+
+```sh
+curl http://localhost:8080/v1/audio/transcriptions \
+  -F file=@recording.mp3 -F model=qwen3-asr \
+  -F language=en -F response_format=verbose_json
+```
+
+Any ffmpeg-decodable audio is accepted; it is resampled to 16 kHz mono before
+recognition. `response_format` may be `json` (default, `{"text": ...}`), `text`
+(plain text) or `verbose_json` (adds `language`, `duration` and `segments`).
+`timestamp_granularities` may be `["segment"]` (word-level timestamps are not
+supported).
+
+Setting the multipart field `stream` to `true` (with `response_format` `json` or
+`text`) transcribes incrementally over Server-Sent Events, matching the
+OpenAI-compatible streaming used by SGLang/vLLM-family servers: zero or more
+`transcript.text.delta` events followed by one `transcript.text.done` event with
+the full transcript, then `data: [DONE]`.
+
+```sh
+curl -N http://localhost:8080/v1/audio/transcriptions \
+  -F file=@recording.mp3 -F model=qwen3-asr \
+  -F language=en -F response_format=json -F stream=true
+```
+
+## Speech synthesis
+
+```sh
+curl http://localhost:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{ "model": "kokoro", "input": "Hello from OpenVINO.", "response_format": "wav" }' \
+  -o speech.wav
+```
+
+`response_format` is `wav` (default) or `pcm` (raw signed 16-bit little-endian
+mono). `voice` and `speed` are accepted for OpenAI-client compatibility; the
+loaded model's own voice/speaker is used and non-1.0 speeds are not applied.
 
 ## Concurrency
 
