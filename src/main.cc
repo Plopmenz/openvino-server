@@ -11,9 +11,11 @@
 
 #include <openvino/runtime/core.hpp>
 
+#include "ovserver/asr.hpp"
 #include "ovserver/audio.hpp"
 #include "ovserver/controller.hpp"
 #include "ovserver/manager.hpp"
+#include "ovserver/tts.hpp"
 
 namespace {
 
@@ -89,6 +91,13 @@ void usage(const char* argv0) {
         << "                          Default: 'ffmpeg' on PATH. Set to an empty\n"
         << "                          string to require 16 kHz WAV uploads and skip\n"
         << "                          MP4 output.\n"
+        << "      --cache-dir PATH    Directory where OpenVINO stores compiled\n"
+        << "                          model blobs, reused across restarts to speed\n"
+        << "                          up model loading. Disabled when not set.\n"
+        << "      --temp-dir PATH     Directory for generated artifacts. Videos\n"
+        << "                          are stored under PATH/videos using a random\n"
+        << "                          UUID as file name, returned to the client as\n"
+        << "                          the video id. Default: system temp dir.\n"
         << "  -d, --device DEVICE     OpenVINO device (CPU, GPU, AUTO, ...).\n"
         << "                          Default: CPU.\n"
         << "  -h, --host HOST         Listen address. Default: 0.0.0.0\n"
@@ -144,6 +153,8 @@ int main(int argc, char** argv) {
     size_t max_ngram_size = 3;
     bool enable_mtp = true;
     std::string ffmpeg = "ffmpeg";
+    std::string cache_dir;
+    std::string temp_dir;
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -170,6 +181,10 @@ int main(int argc, char** argv) {
                 tts_model_ids.push_back(get_arg(argc, argv, i, a.c_str()));
             } else if (a == "--ffmpeg") {
                 ffmpeg = get_arg(argc, argv, i, a.c_str());
+            } else if (a == "--cache-dir") {
+                cache_dir = get_arg(argc, argv, i, a.c_str());
+            } else if (a == "--temp-dir") {
+                temp_dir = get_arg(argc, argv, i, a.c_str());
             } else if (a == "-d" || a == "--device") {
                 device = get_arg(argc, argv, i, a.c_str());
             } else if (a == "-h" || a == "--host") {
@@ -280,6 +295,39 @@ int main(int argc, char** argv) {
 
     ovserver::set_ffmpeg_path(ffmpeg);
 
+    if (!cache_dir.empty()) {
+        try {
+            std::filesystem::create_directories(cache_dir);
+        } catch (const std::exception& e) {
+            std::cerr << "error creating cache dir '" << cache_dir << "': "
+                      << e.what() << "\n";
+            return 2;
+        }
+    }
+
+    // Video outputs are stored under <temp-dir>/videos as <random-uuid>.mp4;
+    // the uuid is used as the video id returned to clients.
+    {
+        std::error_code ec;
+        std::filesystem::path video_root =
+            temp_dir.empty()
+                ? std::filesystem::temp_directory_path(ec)
+                : std::filesystem::path(temp_dir);
+        if (ec) {
+            std::cerr << "error resolving temp dir: " << ec.message() << "\n";
+            return 2;
+        }
+        const std::filesystem::path videos_dir = video_root / "videos";
+        std::error_code mkec;
+        std::filesystem::create_directories(videos_dir, mkec);
+        if (mkec) {
+            std::cerr << "error creating videos dir '" << videos_dir << "': "
+                      << mkec.message() << "\n";
+            return 2;
+        }
+        ovserver::set_video_storage_dir(videos_dir);
+    }
+
     drogon::HttpAppFramework& app = drogon::app();
 
     if (log_level == "TRACE") app.setLogLevel(trantor::Logger::kTrace);
@@ -310,7 +358,8 @@ int main(int argc, char** argv) {
             auto id = image_model_ids.empty() ? std::string("qwen-image")
                                               : image_model_ids[i];
             ovserver::ModelManager::instance().load_image(
-                id, {std::filesystem::path(image_models[i]), device});
+                id, {std::filesystem::path(image_models[i]), device,
+                     cache_dir});
             LOG_INFO << "Image model '" << id
                      << "' ready at /v1/images/generations";
         }
@@ -330,7 +379,8 @@ int main(int argc, char** argv) {
                      prompt_lookup,
                      num_assistant_tokens,
                      max_ngram_size,
-                     enable_mtp});
+                     enable_mtp,
+                     cache_dir});
             LOG_INFO << "Text model '" << id
                      << "' ready at /v1/chat/completions";
         }
@@ -340,9 +390,10 @@ int main(int argc, char** argv) {
             auto id = video_model_ids.empty() ? p.filename().string()
                                               : video_model_ids[i];
             ovserver::ModelManager::instance().load_video(
-                id, {p, device});
+                id, {p, device, cache_dir});
             LOG_INFO << "Video model '" << id
-                     << "' ready at /v1/video/generations";
+                     << "' ready at /v1/videos "
+                        "(async) and /v1/video/generations (sync)";
         }
 
         for (size_t i = 0; i < asr_models.size(); ++i) {
@@ -350,7 +401,7 @@ int main(int argc, char** argv) {
             auto id = asr_model_ids.empty() ? p.filename().string()
                                             : asr_model_ids[i];
             ovserver::ModelManager::instance().load_asr(
-                id, {p, device});
+                id, {p, device, cache_dir});
             LOG_INFO << "ASR model '" << id
                      << "' ready at /v1/audio/transcriptions";
         }
@@ -360,7 +411,7 @@ int main(int argc, char** argv) {
             auto id = tts_model_ids.empty() ? p.filename().string()
                                             : tts_model_ids[i];
             ovserver::ModelManager::instance().load_tts(
-                id, {p, device});
+                id, {p, device, cache_dir});
             LOG_INFO << "TTS model '" << id
                      << "' ready at /v1/audio/speech";
         }

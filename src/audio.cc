@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <random>
 
@@ -141,105 +142,6 @@ std::vector<float> decode_audio_to_f32(const std::string& data, int sample_rate)
     std::filesystem::remove(in);
     std::filesystem::remove(out);
     return result;
-}
-
-ASRModel::ASRModel(const std::string& id,
-                   const std::filesystem::path& models_path,
-                   const std::string& device)
-    : m_id(id), m_models_path(models_path), m_device(device) {
-    std::cerr << "asr load: warm start" << std::endl;
-    m_pipeline = std::make_shared<ov::genai::ASRPipeline>(m_models_path.string(),
-                                                          m_device);
-    std::cerr << "asr load: done" << std::endl;
-}
-
-ASRModel::~ASRModel() = default;
-
-ASRResult ASRModel::generate(const ASRGenerateOptions& opts,
-                             ASROnText on_text) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    ov::genai::ASRGenerationConfig cfg;
-    cfg.language = opts.language;
-    cfg.task = opts.task;
-    cfg.initial_prompt = opts.initial_prompt;
-    cfg.context = opts.context;
-    cfg.return_timestamps = opts.return_timestamps;
-    if (opts.temperature)
-        cfg.temperature = *opts.temperature;
-    if (opts.max_new_tokens)
-        cfg.max_new_tokens = *opts.max_new_tokens;
-
-    std::cerr << "asr start: samples=" << opts.samples.size() << std::endl;
-
-    const auto start = std::chrono::steady_clock::now();
-    const ov::genai::AudioInputs input{opts.samples};
-    ov::genai::ASRDecodedResults result;
-    if (on_text) {
-        result = m_pipeline->generate(input, cfg, on_text);
-    } else {
-        result = m_pipeline->generate(input, cfg);
-    }
-
-    ASRResult out;
-    if (!result.texts.empty())
-        out.text = result.texts[0];
-    if (!result.languages.empty())
-        out.language = result.languages[0];
-    if (result.chunks && !result.chunks->empty()) {
-        for (const auto& chunk : (*result.chunks)[0]) {
-            ASRSegment seg;
-            seg.start = chunk.start_ts;
-            seg.end = chunk.end_ts;
-            seg.text = chunk.text;
-            out.segments.push_back(std::move(seg));
-        }
-    }
-
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - start)
-                             .count();
-    std::cerr << "asr done: ms=" << elapsed << std::endl;
-    return out;
-}
-
-TTSModel::TTSModel(const std::string& id,
-                   const std::filesystem::path& models_path,
-                   const std::string& device)
-    : m_id(id), m_models_path(models_path), m_device(device) {
-    std::cerr << "tts load: warm start" << std::endl;
-    m_pipeline =
-        std::make_shared<ov::genai::Text2SpeechPipeline>(m_models_path.string(),
-                                                         m_device);
-    std::cerr << "tts load: done" << std::endl;
-}
-
-TTSModel::~TTSModel() = default;
-
-TTSResult TTSModel::generate(const std::string& text) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    std::cerr << "tts start: text=" << text << std::endl;
-    const ov::genai::Text2SpeechDecodedResults result =
-        m_pipeline->generate(std::vector<std::string>{text});
-    if (result.speeches.empty())
-        throw std::runtime_error("tts: no speech produced");
-    const ov::Tensor& speech = result.speeches.front();
-    if (speech.get_element_type() != ov::element::f32)
-        throw std::runtime_error("tts: unexpected sample element type " +
-                                 speech.get_element_type().get_type_name());
-    const float* data = speech.data<float>();
-    const std::size_t count = static_cast<std::size_t>(speech.get_size());
-    TTSResult out;
-    out.sample_rate = result.output_sample_rate;
-    out.samples.reserve(count);
-    for (std::size_t i = 0; i < count; ++i) {
-        const float v = data[i];
-        const float c = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
-        out.samples.push_back(
-            static_cast<std::int16_t>(c * 32767.0f));
-    }
-    std::cerr << "tts done: samples=" << count << " rate=" << out.sample_rate
-          << std::endl;
-    return out;
 }
 
 }  // namespace ovserver

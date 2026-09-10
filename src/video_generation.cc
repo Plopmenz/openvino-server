@@ -3,20 +3,64 @@
 
 #include "ovserver/video_generation.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
 
 #include <openvino/runtime/intel_gpu/properties.hpp>
 #include <openvino/runtime/properties.hpp>
 #include <openvino/genai/image_generation/generation_config.hpp>
 #include <openvino/genai/video_generation/generation_config.hpp>
+#include <openvino/runtime/core.hpp>
 
 #include "ovserver/audio.hpp"
-#include <iostream>
 
 namespace ovserver {
 namespace {
+
+std::size_t proc_field_kb(const std::string& field) {
+    std::ifstream status("/proc/self/status");
+    if (!status) {
+        return 0;
+    }
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind(field, 0) == 0) {
+            const std::size_t pos = line.find_first_of("0123456789");
+            if (pos != std::string::npos) {
+                return static_cast<std::size_t>(std::stoull(line.substr(pos)));
+            }
+        }
+    }
+    return 0;
+}
+
+// Total GPU device memory currently allocated by the plugin, in MiB.
+// Returns -1 when not applicable (non-GPU device, plugin unavailable).
+double device_gpu_mib(const std::string& device) {
+    if (device.find("GPU") == std::string::npos) {
+        return -1.0;
+    }
+    try {
+        ov::Core core;
+        auto stats = core.get_property(device, ov::intel_gpu::memory_statistics);
+        std::uint64_t bytes = 0;
+        for (const auto& [name, value] : stats) {
+            bytes += value;
+        }
+        return static_cast<double>(bytes) / (1024.0 * 1024.0);
+    } catch (const std::exception&) {
+        return -1.0;
+    }
+}
 
 std::string shell_quote(const std::string& value) {
     std::string out;
@@ -122,6 +166,64 @@ VideoFrame copy_plane(const ov::Tensor& tensor,
         tensor.get_element_type().get_type_name());
 }
 
+// Rounds up to the next multiple of 32, the spatial compression factor of the
+// LTX-Video VAE. Sizes that are not multiples of 32 (e.g. 1280x720) are
+// generated at the padded resolution and resized down afterwards.
+std::int64_t align32(std::int64_t v) {
+    if (v <= 0) return v;
+    return (v + 31) / 32 * 32;
+}
+
+// Bilinear RGB resize of a decoded frame. Produces exactly the requested
+// dimensions, whatever resolution the model actually decoded.
+VideoFrame resize_frame(const VideoFrame& f,
+                        std::size_t out_width,
+                        std::size_t out_height) {
+    VideoFrame out;
+    out.width = out_width;
+    out.height = out_height;
+    if (out_width == f.width && out_height == f.height) {
+        out.rgb = f.rgb;
+        return out;
+    }
+    if (f.width == 0 || f.height == 0) {
+        throw std::runtime_error("video: cannot resize an empty frame");
+    }
+    out.rgb.resize(out_height * out_width * 3);
+    const double sx = static_cast<double>(f.width) / out_width;
+    const double sy = static_cast<double>(f.height) / out_height;
+    const auto* src = f.rgb.data();
+    auto* dst = out.rgb.data();
+    for (std::size_t y = 0; y < out_height; ++y) {
+        const double fy = std::min<double>(f.height - 1, y * sy);
+        const std::size_t y0 = static_cast<std::size_t>(fy);
+        const std::size_t y1 = std::min(f.height - 1, y0 + 1);
+        const double wy = fy - y0;
+        for (std::size_t x = 0; x < out_width; ++x) {
+            const double fx = std::min<double>(f.width - 1, x * sx);
+            const std::size_t x0 = static_cast<std::size_t>(fx);
+            const std::size_t x1 = std::min(f.width - 1, x0 + 1);
+            const double wx = fx - x0;
+            const auto* p00 = src + (y0 * f.width + x0) * 3;
+            const auto* p10 = src + (y0 * f.width + x1) * 3;
+            const auto* p01 = src + (y1 * f.width + x0) * 3;
+            const auto* p11 = src + (y1 * f.width + x1) * 3;
+            auto* d = dst + (y * out_width + x) * 3;
+            for (int c = 0; c < 3; ++c) {
+                const double top = static_cast<double>(p00[c]) +
+                                   wx * (p10[c] - p00[c]);
+                const double bot = static_cast<double>(p01[c]) +
+                                   wx * (p11[c] - p01[c]);
+                double v = top + wy * (bot - top);
+                if (v < 0.0) v = 0.0;
+                if (v > 255.0) v = 255.0;
+                d[c] = static_cast<std::uint8_t>(v + 0.5);
+            }
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
 std::uint64_t write_video_mp4(const std::string& path,
@@ -132,22 +234,49 @@ std::uint64_t write_video_mp4(const std::string& path,
 VideoGenerationModel::VideoGenerationModel(
     const std::string& id,
     const std::filesystem::path& models_path,
-    const std::string& device)
+    const std::string& device,
+    const std::string& cache_dir)
     : m_id(id), m_models_path(models_path), m_device(device) {
-    std::cerr << "video load: warm start" << std::endl;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::cerr << "[video model '" << id << "'] loading from " << m_models_path
+              << " on " << m_device << " ..." << std::endl;
     ov::AnyMap properties;
     if (m_device.find("GPU") != std::string::npos) {
-        properties[ov::hint::kv_cache_precision.name()] =
-            ov::element::u8;
-        properties[ov::hint::dynamic_quantization_group_size.name()] =
-            std::uint64_t{32};
-        properties[ov::intel_gpu::hint::enable_sdpa_optimization.name()] =
-            true;
+        properties.emplace(ov::hint::kv_cache_precision(ov::element::u8));
+        properties.emplace(
+            ov::hint::dynamic_quantization_group_size(std::uint64_t{32}));
+        properties.emplace(
+            ov::intel_gpu::hint::enable_sdpa_optimization(true));
     }
-    m_pipeline =
-        std::make_shared<ov::genai::Text2VideoPipeline>(m_models_path.string(),
-                                                        m_device, properties);
-    std::cerr << "video load: done" << std::endl;
+    if (!cache_dir.empty()) {
+        properties.emplace(ov::cache_dir(cache_dir));
+    }
+    try {
+        m_pipeline =
+            std::make_shared<ov::genai::Text2VideoPipeline>(m_models_path.string(),
+                                                            m_device, properties);
+    } catch (const std::exception& e) {
+        std::cerr << "[video model '" << id << "'] loading FAILED: " << e.what()
+                  << std::endl;
+        throw;
+    }
+    const auto load_s = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+    std::cerr << "[video model '" << id << "'] loaded in " << load_s
+              << " s" << std::endl;
+    std::cerr << "[video model '" << id << "'] memory: ";
+    const double gpu_mib = device_gpu_mib(m_device);
+    if (gpu_mib >= 0.0) {
+        std::cerr << "GPU " << std::fixed << std::setprecision(2)
+                  << (gpu_mib / 1024.0) << " GiB" << std::endl;
+    } else if (m_device.find("GPU") != std::string::npos) {
+        std::cerr << "GPU ??? GiB" << std::endl;
+    } else {
+        std::cerr << "CPU " << std::fixed << std::setprecision(2)
+                  << (proc_field_kb("VmRSS:") / (1024.0 * 1024.0)) << " GiB"
+                  << std::endl;
+    }
 }
 
 VideoGenerationModel::~VideoGenerationModel() = default;
@@ -163,12 +292,17 @@ std::vector<VideoResult> VideoGenerationModel::generate(
         properties[ov::genai::negative_prompt.name()] = *opts.negative_prompt;
     if (opts.guidance_scale)
         properties[ov::genai::guidance_scale.name()] = *opts.guidance_scale;
+    // Arbitrary requested sizes (e.g. 1280x720, where 720 is not a multiple of
+    // 32) are generated at the next multiple of 32 -- the LTX-Video VAE's
+    // spatial compression factor -- and resized back to the exact requested
+    // dimensions below.
+    const bool both_dims = opts.width && opts.height;
     if (opts.height)
-        properties[ov::genai::height.name()] =
-            static_cast<std::int64_t>(*opts.height);
+        properties[ov::genai::height.name()] = static_cast<std::int64_t>(
+            both_dims ? align32(*opts.height) : *opts.height);
     if (opts.width)
-        properties[ov::genai::width.name()] =
-            static_cast<std::int64_t>(*opts.width);
+        properties[ov::genai::width.name()] = static_cast<std::int64_t>(
+            both_dims ? align32(*opts.width) : *opts.width);
     if (opts.num_inference_steps)
         properties[ov::genai::num_inference_steps.name()] =
             *opts.num_inference_steps;
@@ -213,6 +347,26 @@ std::vector<VideoResult> VideoGenerationModel::generate(
             res.frames.push_back(
                 copy_plane(video, n * num_frames + f, height, width));
         videos.push_back(std::move(res));
+    }
+
+    // Deliver exactly the requested size even when the model output was padded
+    // up to a multiple of 32.
+    if (both_dims) {
+        const std::size_t out_w = static_cast<std::size_t>(*opts.width);
+        const std::size_t out_h = static_cast<std::size_t>(*opts.height);
+        for (auto& v : videos) {
+            for (auto& f : v.frames) {
+                f = resize_frame(f, out_w, out_h);
+            }
+        }
+        const double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        std::cerr << "video gen done: req=" << req_id << " ms=" << elapsed
+                  << " videos=" << num_videos << " frames=" << num_frames
+                  << " decoded=" << height << "x" << width
+                  << " output=" << out_h << "x" << out_w << std::endl;
+        return videos;
     }
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -18,7 +18,8 @@ void ModelManager::load_image(const std::string& id,
     if (m_image_models.find(id) != m_image_models.end()) {
         throw std::runtime_error("image model '" + id + "' already loaded");
     }
-    auto model = std::make_shared<ImageGenerationModel>(id, spec.path, spec.device);
+    auto model = std::make_shared<ImageGenerationModel>(
+        id, spec.path, spec.device, spec.cache_dir);
     m_image_models.emplace(id, std::move(model));
 }
 
@@ -57,7 +58,8 @@ void ModelManager::load_video(const std::string& id,
         throw std::runtime_error("video model '" + id + "' already loaded");
     }
     auto model =
-        std::make_shared<VideoGenerationModel>(id, spec.path, spec.device);
+        std::make_shared<VideoGenerationModel>(id, spec.path, spec.device,
+                                               spec.cache_dir);
     m_video_models.emplace(id, std::move(model));
 }
 
@@ -75,7 +77,8 @@ void ModelManager::load_asr(const std::string& id, const ASRSpec& spec) {
     if (m_asr_models.find(id) != m_asr_models.end()) {
         throw std::runtime_error("asr model '" + id + "' already loaded");
     }
-    auto model = std::make_shared<ASRModel>(id, spec.path, spec.device);
+    auto model = std::make_shared<ASRModel>(id, spec.path, spec.device,
+                                            spec.cache_dir);
     m_asr_models.emplace(id, std::move(model));
 }
 
@@ -93,7 +96,8 @@ void ModelManager::load_tts(const std::string& id, const TTSSpec& spec) {
     if (m_tts_models.find(id) != m_tts_models.end()) {
         throw std::runtime_error("tts model '" + id + "' already loaded");
     }
-    auto model = std::make_shared<TTSModel>(id, spec.path, spec.device);
+    auto model = std::make_shared<TTSModel>(id, spec.path, spec.device,
+                                            spec.cache_dir);
     m_tts_models.emplace(id, std::move(model));
 }
 

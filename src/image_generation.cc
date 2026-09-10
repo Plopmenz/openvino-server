@@ -16,6 +16,7 @@
 #include <openvino/genai/image_generation/generation_config.hpp>
 #include <openvino/genai/image_generation/text2image_pipeline.hpp>
 #include <openvino/runtime/core.hpp>
+#include <openvino/runtime/properties.hpp>
 #include <openvino/runtime/intel_gpu/properties.hpp>
 
 namespace ovserver {
@@ -78,7 +79,8 @@ ImageResult extract_image(const ov::Tensor& result, std::size_t index) {
 ImageGenerationModel::ImageGenerationModel(
     const std::string& id,
     const std::filesystem::path& models_path,
-    const std::string& device)
+    const std::string& device,
+    const std::string& cache_dir)
     : m_id(id), m_models_path(models_path), m_device(device) {
     // Build the pipeline on startup, exactly like the reference Python path
     // (Text2ImagePipeline(path, device)): no shape or plugin configuration.
@@ -86,8 +88,12 @@ ImageGenerationModel::ImageGenerationModel(
     std::cerr << "[image model '" << id << "'] loading from " << models_path
               << " on " << device << " ..." << std::endl;
     try {
+        ov::AnyMap properties;
+        if (!cache_dir.empty()) {
+            properties.emplace(ov::cache_dir(cache_dir));
+        }
         m_pipeline = std::make_shared<ov::genai::Text2ImagePipeline>(
-            m_models_path, m_device);
+            m_models_path, m_device, properties);
     } catch (const std::exception& e) {
         std::cerr << "[image model '" << id << "'] loading FAILED: " << e.what()
                   << std::endl;

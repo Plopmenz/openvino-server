@@ -53,7 +53,8 @@ class VideoGenerationModel {
 public:
     VideoGenerationModel(const std::string& id,
                          const std::filesystem::path& models_path,
-                         const std::string& device);
+                         const std::string& device,
+                         const std::string& cache_dir);
 
     VideoGenerationModel(const VideoGenerationModel&) = delete;
     VideoGenerationModel& operator=(const VideoGenerationModel&) = delete;
@@ -77,6 +78,8 @@ private:
 struct VideoGenerationSpec {
     std::filesystem::path path;
     std::string device;
+    // Directory for OpenVINO compiled-model blobs. Empty disables caching.
+    std::string cache_dir;
 };
 
 // Encodes a video as H.264/MP4 and writes it to `path` via a pipefed ffmpeg.

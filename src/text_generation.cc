@@ -475,6 +475,9 @@ TextGenerationModel::TextGenerationModel(const std::string& id,
         // map (forwarded to ov::Core::compile_model by the pipeline). For
         // non-GPU devices they would be rejected, so they are only set on GPU.
         ov::AnyMap props;
+        if (!spec.cache_dir.empty()) {
+            props.emplace(ov::cache_dir(spec.cache_dir));
+        }
         if (m_device.find("GPU") != std::string::npos) {
             props.emplace(
                 ov::hint::kv_cache_precision(ov::element::Type(spec.kv_cache_precision)));

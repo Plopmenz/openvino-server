@@ -188,6 +188,8 @@ struct TextGenerationSpec {
     std::size_t max_ngram_size = 3;
     // Auto-detect bundled MTP head (openvino_mtp_model.xml) in model dir.
     bool enable_mtp = true;
+    // Directory for OpenVINO compiled-model blobs. Empty disables caching.
+    std::string cache_dir;
 };
 
 }  // namespace ovserver

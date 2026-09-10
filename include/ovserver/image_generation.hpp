@@ -49,7 +49,8 @@ class ImageGenerationModel {
 public:
     ImageGenerationModel(const std::string& id,
                          const std::filesystem::path& models_path,
-                         const std::string& device);
+                         const std::string& device,
+                         const std::string& cache_dir);
 
     ImageGenerationModel(const ImageGenerationModel&) = delete;
     ImageGenerationModel& operator=(const ImageGenerationModel&) = delete;
@@ -90,6 +91,8 @@ private:
 struct ImageGenerationSpec {
     std::filesystem::path path;
     std::string device;
+    // Directory for OpenVINO compiled-model blobs. Empty disables caching.
+    std::string cache_dir;
 };
 
 }  // namespace ovserver

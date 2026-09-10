@@ -6,8 +6,11 @@
 #include <json/json.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -17,17 +20,21 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
+#include "ovserver/asr.hpp"
 #include "ovserver/audio.hpp"
 #include "ovserver/base64.hpp"
 #include "ovserver/image.hpp"
 #include "ovserver/image_decode.hpp"
 #include "ovserver/manager.hpp"
+#include "ovserver/tts.hpp"
 #include "ovserver/image_generation.hpp"
 #include "ovserver/text_generation.hpp"
 #include "ovserver/video_generation.hpp"
@@ -1081,196 +1088,610 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
         {drogon::Post});
 }
 
+// ---------------------------------------------------------------------------
+// Video generation job API. Implements the OpenAI Videos library the way vLLM
+// and SGLang do: POST /v1/videos creates an asynchronous job whose id is a
+// random 128-bit UUID; the same UUID names the stored MP4 file (<uuid>.mp4)
+// under <temp-dir>/videos. GET /v1/videos/{id} polls status, GET
+// /v1/videos/{id}/content streams the finished file. No list endpoint: ids are
+// returned to the client and never enumerate server-side. The synchronous
+// /v1/video/generations endpoint shares the same storage and returns the OpenAI
+// video-generations response shape.
+// ---------------------------------------------------------------------------
+
+// Standard RFC 4122 UUID v4 (122 random bits, 128 in the string). Large enough
+// that ids cannot be brute-forced.
+std::string random_uuid() {
+    thread_local std::mt19937_64 rng([] {
+        std::random_device rd;
+        const auto now = std::chrono::high_resolution_clock::now()
+                             .time_since_epoch()
+                             .count();
+        std::seed_seq seed{rd(), rd(), rd(), rd(),
+                           static_cast<unsigned>(static_cast<std::uint64_t>(now)),
+                           static_cast<unsigned>(static_cast<std::uint64_t>(now) >> 32)};
+        return std::mt19937_64(seed);
+    }());
+    const std::uint64_t hi = rng();
+    const std::uint64_t lo = rng();
+    std::array<std::uint8_t, 16> bytes;
+    for (int i = 0; i < 8; ++i) {
+        bytes[i] = static_cast<std::uint8_t>(hi >> (8 * (7 - i)));
+        bytes[8 + i] = static_cast<std::uint8_t>(lo >> (8 * (7 - i)));
+    }
+    bytes[6] = static_cast<std::uint8_t>((bytes[6] & 0x0F) | 0x40);  // version 4
+    bytes[8] = static_cast<std::uint8_t>((bytes[8] & 0x3F) | 0x80);  // variant
+    static const char* const hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(36);
+    for (int i = 0; i < 16; ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) out += '-';
+        out += hex[bytes[i] >> 4];
+        out += hex[bytes[i] & 0x0F];
+    }
+    return out;
+}
+
+enum class VideoJobStatus { queued, running, completed, failed };
+
+// One asynchronous video generation job. Jobs are never enumerated (there is no
+// list endpoint), so records simply live until the server exits.
+struct VideoJob {
+    std::string id;
+    std::string model_id;
+    std::string prompt;
+    VideoJobStatus status = VideoJobStatus::queued;
+    std::time_t created_at = std::time(nullptr);
+    std::time_t completed_at = 0;
+    double inference_time_s = 0.0;
+    std::string error;
+    std::vector<std::string> file_paths;  // absolute paths to stored MP4 files
+    std::string size;                     // requested "WxH", may be empty
+    std::string seconds;                  // requested duration, may be empty
+    std::size_t num_outputs = 1;
+};
+
+std::mutex g_video_jobs_mutex;
+std::unordered_map<std::string, VideoJob> g_video_jobs;
+// Absolute path to the directory holding generated videos (<dir>/videos).
+std::filesystem::path g_video_storage_dir;
+
+// Request fields shared by the async job API and the synchronous generations
+// endpoint.
+struct ParsedVideoRequest {
+    VideoGenerationModel* model = nullptr;
+    VideoGenerateOptions opts;
+    std::size_t num_videos = 1;
+    std::string size;
+    std::string seconds;
+};
+
+// Parses a vLLM/SGLang-style video request body into VideoGenerateOptions.
+// Throws std::runtime_error (mapped to HTTP 400) on malformed input. A null
+// model means the caller should return HTTP 404.
+ParsedVideoRequest parse_video_request(const Json::Value& body) {
+    ParsedVideoRequest p;
+    p.opts.prompt = getString(body, "prompt");
+
+    if (!body.isMember("model")) {
+        auto& models = ModelManager::instance().all_video();
+        if (models.size() == 1) {
+            p.model = models.begin()->second.get();
+        }
+    } else if (body["model"].isString()) {
+        p.model = ModelManager::instance().get_video(body["model"].asString());
+    }
+
+    if (body.isMember("negative_prompt") && body["negative_prompt"].isString()) {
+        p.opts.negative_prompt = body["negative_prompt"].asString();
+    }
+    if (body.isMember("guidance_scale") && body["guidance_scale"].isNumeric()) {
+        p.opts.guidance_scale =
+            static_cast<float>(body["guidance_scale"].asDouble());
+    }
+    int64_t steps = 0;
+    if (body.isMember("num_inference_steps") &&
+        body["num_inference_steps"].isIntegral()) {
+        steps = body["num_inference_steps"].asInt64();
+    } else if (body.isMember("steps") && body["steps"].isIntegral()) {
+        steps = body["steps"].asInt64();
+    }
+    if (steps > 0) {
+        p.opts.num_inference_steps = static_cast<std::size_t>(steps);
+    }
+    if (body.isMember("seed") && body["seed"].isIntegral()) {
+        p.opts.rng_seed = static_cast<std::size_t>(
+            std::max<int64_t>(0, body["seed"].asInt64()));
+    }
+    if (body.isMember("n") && body["n"].isIntegral()) {
+        p.num_videos = static_cast<std::size_t>(
+            std::clamp<int64_t>(body["n"].asInt64(), 1, 4));
+        p.opts.num_videos = p.num_videos;
+    }
+    if (body.isMember("num_outputs_per_prompt") &&
+        body["num_outputs_per_prompt"].isIntegral()) {
+        p.num_videos = static_cast<std::size_t>(
+            std::clamp<int64_t>(body["num_outputs_per_prompt"].asInt64(), 1, 4));
+        p.opts.num_videos = p.num_videos;
+    }
+
+    double fps = 25.0;
+    if (body.isMember("fps") && body["fps"].isNumeric()) {
+        fps = body["fps"].asDouble();
+        if (fps > 0) p.opts.frame_rate = static_cast<float>(fps);
+    }
+    if (body.isMember("num_frames") && body["num_frames"].isIntegral()) {
+        p.opts.num_frames = static_cast<std::size_t>(
+            std::max<int64_t>(1, body["num_frames"].asInt64()));
+    }
+    if (!p.opts.num_frames && body.isMember("seconds")) {
+        double seconds = 0.0;
+        if (body["seconds"].isIntegral()) {
+            seconds = static_cast<double>(body["seconds"].asInt64());
+        } else if (body["seconds"].isString()) {
+            std::string s = body["seconds"].asString();
+            if (!s.empty() && (s.back() == 's' || s.back() == 'S')) {
+                s.pop_back();
+            }
+            try {
+                seconds = std::stod(s);
+            } catch (const std::exception&) {
+                seconds = 0.0;
+            }
+        }
+        if (seconds > 0) {
+            p.opts.num_frames = static_cast<std::size_t>(
+                std::max(1.0, seconds * fps));
+        }
+    }
+    if (body.isMember("seconds")) {
+        if (body["seconds"].isIntegral()) {
+            p.seconds = std::to_string(body["seconds"].asInt64());
+        } else if (body["seconds"].isString()) {
+            p.seconds = body["seconds"].asString();
+        }
+    }
+
+    // Dimensions: OpenAI "size" ("1280x720") or explicit width/height. Passed
+    // through exactly -- no 16/32 multiple rounding here. The model generates
+    // at a padded multiple of 32 and the server resizes the frames back to the
+    // requested size (see VideoGenerationModel::generate), so arbitrary sizes
+    // like 1280x720 work.
+    const bool have_size = body.isMember("size") && body["size"].isString();
+    if (have_size) {
+        const std::string size = body["size"].asString();
+        const auto x = size.find_first_of("xX");
+        if (x == std::string::npos) {
+            throw std::runtime_error(
+                "'size' must be formatted as \"WxH\", e.g. \"1280x720\"");
+        }
+        const int64_t w = std::stoll(size.substr(0, x));
+        const int64_t h = std::stoll(size.substr(x + 1));
+        if (w <= 0 || h <= 0) {
+            throw std::runtime_error("'size' dimensions must be positive");
+        }
+        p.opts.width = w;
+        p.opts.height = h;
+        p.size = size;
+    } else {
+        int64_t w = 0, h = 0;
+        getInt64(body, "width", w);
+        getInt64(body, "height", h);
+        if (w > 0 || h > 0) {
+            if (w <= 0 || h <= 0) {
+                throw std::runtime_error(
+                    "'width' and 'height' must be provided together");
+            }
+            p.opts.width = w;
+            p.opts.height = h;
+            p.size = std::to_string(w) + "x" + std::to_string(h);
+        }
+    }
+    return p;
+}
+
+// Parses a JSON request body into a Json::Value, throwing std::runtime_error
+// (mapped to HTTP 400) on malformed input.
+Json::Value parse_json_body(const drogon::HttpRequestPtr& req) {
+    Json::CharReaderBuilder reader;
+    reader["failIfExtra"] = false;
+    auto body_view = req->getBody();
+    std::istringstream stream(std::string(body_view.begin(), body_view.end()));
+    Json::Value body;
+    std::string errs;
+    if (!Json::parseFromStream(reader, stream, &body, &errs) ||
+        !body.isObject()) {
+        throw std::runtime_error("Invalid JSON request body: " + errs);
+    }
+    return body;
+}
+
+const char* video_job_status_name(VideoJobStatus s) {
+    switch (s) {
+        case VideoJobStatus::queued: return "queued";
+        case VideoJobStatus::running: return "running";
+        case VideoJobStatus::completed: return "completed";
+        case VideoJobStatus::failed: return "failed";
+    }
+    return "queued";
+}
+
+Json::Value video_job_json(const VideoJob& job) {
+    Json::Value out;
+    out["id"] = job.id;
+    out["object"] = "video";
+    out["model"] = job.model_id;
+    out["prompt"] = job.prompt;
+    out["status"] = video_job_status_name(job.status);
+    out["created_at"] = static_cast<int>(job.created_at);
+    if (job.size.empty()) {
+        out["size"] = Json::Value();
+    } else {
+        out["size"] = job.size;
+    }
+    if (job.seconds.empty()) {
+        out["seconds"] = Json::Value();
+    } else {
+        out["seconds"] = job.seconds;
+    }
+    out["quality"] = "standard";
+    out["progress"] =
+        (job.status == VideoJobStatus::completed ||
+         job.status == VideoJobStatus::failed)
+            ? 100
+            : 0;
+    if (job.completed_at) {
+        out["completed_at"] = static_cast<int>(job.completed_at);
+    }
+    if (job.inference_time_s > 0.0) {
+        out["inference_time_s"] = job.inference_time_s;
+    }
+    if (job.status == VideoJobStatus::failed) {
+        out["error"] = job.error;
+    } else {
+        out["error"] = Json::nullValue;
+    }
+    if (job.status == VideoJobStatus::completed && !job.file_paths.empty()) {
+        out["url"] = "/v1/videos/" + job.id + "/content";
+        out["file_name"] =
+            std::filesystem::path(job.file_paths.front()).filename().string();
+        out["num_outputs"] = static_cast<int>(job.file_paths.size());
+        Json::Value names = Json::arrayValue;
+        for (const auto& p : job.file_paths) {
+            names.append(std::filesystem::path(p).filename().string());
+        }
+        out["file_names"] = names;
+    }
+    return out;
+}
+
+// Generates with `model`, stores every output video in the storage directory as
+// <id>.mp4 (additional outputs as <id>_N.mp4) and updates the job status.
+// Returns an empty string on success, otherwise the error message; the job is
+// marked failed in that case.
+std::string run_video_job(VideoGenerationModel* model,
+                          const VideoGenerateOptions& opts,
+                          const std::string& id) {
+    std::string error;
+    const auto t0 = std::chrono::steady_clock::now();
+    {
+        std::lock_guard lock(g_video_jobs_mutex);
+        auto it = g_video_jobs.find(id);
+        if (it != g_video_jobs.end()) {
+            it->second.status = VideoJobStatus::running;
+        }
+    }
+    try {
+        const auto results = model->generate(opts);
+        std::filesystem::path storage_dir;
+        {
+            std::lock_guard lock(g_video_jobs_mutex);
+            storage_dir = g_video_storage_dir;
+        }
+        if (storage_dir.empty()) {
+            std::error_code ec;
+            storage_dir = std::filesystem::temp_directory_path(ec) / "videos";
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(storage_dir, ec);
+        if (ec) {
+            throw std::runtime_error("cannot create videos directory '" +
+                                     storage_dir.string() + "': " + ec.message());
+        }
+
+        std::vector<std::string> paths;
+        paths.reserve(results.size());
+        for (std::size_t i = 0; i < results.size(); ++i) {
+            std::string name = id + ".mp4";
+            if (i > 0) {
+                name = id + "_" + std::to_string(i + 1) + ".mp4";
+            }
+            const std::string path = (storage_dir / name).string();
+            if (!write_video_mp4(path, results[i])) {
+                throw std::runtime_error("cannot write MP4 to " + path);
+            }
+            paths.push_back(path);
+        }
+
+        const double elapsed = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - t0)
+                                   .count();
+        std::lock_guard lock(g_video_jobs_mutex);
+        auto it = g_video_jobs.find(id);
+        if (it != g_video_jobs.end()) {
+            it->second.file_paths = std::move(paths);
+            it->second.status = VideoJobStatus::completed;
+            it->second.completed_at = std::time(nullptr);
+            it->second.inference_time_s = elapsed;
+        }
+    } catch (const std::exception& e) {
+        error = e.what();
+        std::lock_guard lock(g_video_jobs_mutex);
+        auto it = g_video_jobs.find(id);
+        if (it != g_video_jobs.end()) {
+            it->second.status = VideoJobStatus::failed;
+            it->second.error = error;
+            it->second.completed_at = std::time(nullptr);
+        }
+    }
+    return error;
+}
+
 }  // namespace
 
+void set_video_storage_dir(const std::filesystem::path& dir) {
+    std::lock_guard lock(g_video_jobs_mutex);
+    g_video_storage_dir = dir;
+}
+
 void registerVideoGenerations(drogon::HttpAppFramework& app) {
+    // POST /v1/videos -- create an asynchronous video generation job.
     app.registerHandler(
-        "/v1/video/generations",
+        "/v1/videos",
         [](const drogon::HttpRequestPtr& req,
            std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
-            Json::CharReaderBuilder reader;
-            reader["failIfExtra"] = false;
-            auto body_view = req->getBody();
-            std::istringstream stream(std::string(body_view.begin(), body_view.end()));
             Json::Value body;
-            std::string errs;
-            if (!Json::parseFromStream(reader, stream, &body, &errs) ||
-                !body.isObject()) {
-                callback(error_response("Invalid JSON request body: " + errs,
-                                        drogon::k400BadRequest));
+            try {
+                body = parse_json_body(req);
+            } catch (const std::exception& e) {
+                callback(error_response(e.what(), drogon::k400BadRequest));
                 return;
             }
-
             try {
-                const std::string prompt = getString(body, "prompt");
-                VideoGenerationModel* model = nullptr;
-
-                if (!body.isMember("model")) {
-                    auto& models = ModelManager::instance().all_video();
-                    if (models.size() == 1) {
-                        model = models.begin()->second.get();
-                    }
-                } else if (body["model"].isString()) {
-                    model = ModelManager::instance().get_video(body["model"].asString());
-                }
-                if (!model) {
+                ParsedVideoRequest p = parse_video_request(body);
+                if (!p.model) {
                     callback(error_response(
                         "The requested video model is not available. Start the "
                         "server with --txt2vid or provide a valid 'model' field.",
                         drogon::k404NotFound));
                     return;
                 }
+                const std::string id = random_uuid();
+                {
+                    std::lock_guard lock(g_video_jobs_mutex);
+                    g_video_jobs.emplace(
+                        id, VideoJob{id, p.model->id(), p.opts.prompt,
+                                     VideoJobStatus::queued, std::time(nullptr),
+                                     0, 0.0, "", {}, p.size, p.seconds,
+                                     p.num_videos});
+                }
+                pool().enqueue([model = p.model, opts = p.opts, id] {
+                    const std::string err = run_video_job(model, opts, id);
+                    std::cerr << "video job " << id
+                              << (err.empty() ? " completed" : " failed: " + err)
+                              << std::endl;
+                });
+                Json::Value out;
+                {
+                    std::lock_guard lock(g_video_jobs_mutex);
+                    out = video_job_json(g_video_jobs.at(id));
+                }
+                callback(json_response(out));
+            } catch (const std::exception& e) {
+                callback(error_response(e.what(), drogon::k400BadRequest));
+            }
+        },
+        {drogon::Post});
 
-                VideoGenerateOptions opts;
-                opts.prompt = prompt;
-                if (body.isMember("negative_prompt") &&
-                    body["negative_prompt"].isString()) {
-                    opts.negative_prompt = body["negative_prompt"].asString();
-                }
-                if (body.isMember("guidance_scale") &&
-                    body["guidance_scale"].isNumeric()) {
-                    opts.guidance_scale =
-                        static_cast<float>(body["guidance_scale"].asDouble());
-                }
-                if (body.isMember("steps") && body["steps"].isIntegral()) {
-                    opts.num_inference_steps = static_cast<std::size_t>(
-                        std::max<int64_t>(1, body["steps"].asInt64()));
-                }
-                if (body.isMember("seed") && body["seed"].isIntegral()) {
-                    opts.rng_seed = static_cast<std::size_t>(
-                        std::max<int64_t>(0, body["seed"].asInt64()));
-                }
-                if (body.isMember("n") && body["n"].isIntegral()) {
-                    opts.num_videos = static_cast<std::size_t>(
-                        std::clamp<int64_t>(body["n"].asInt64(), 1, 4));
-                }
-                if (body.isMember("num_frames") && body["num_frames"].isIntegral()) {
-                    opts.num_frames = static_cast<std::size_t>(std::max<int64_t>(
-                        1, body["num_frames"].asInt64()));
-                }
-                float fps = 25.0f;
-                if (body.isMember("fps") && body["fps"].isNumeric()) {
-                    fps = static_cast<float>(body["fps"].asDouble());
-                    if (fps > 0) opts.frame_rate = fps;
-                }
-                if (!opts.num_frames && body.isMember("duration") &&
-                    body["duration"].isNumeric()) {
-                    opts.num_frames = static_cast<std::size_t>(std::max(
-                        1.0, body["duration"].asDouble() * fps));
-                }
+    // GET /v1/videos/{id} -- poll the status of a video generation job.
+    app.registerHandler(
+        "/v1/videos/{1}",
+        [](const drogon::HttpRequestPtr& /*req*/,
+           std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+           const std::string& id) {
+            std::lock_guard lock(g_video_jobs_mutex);
+            const auto it = g_video_jobs.find(id);
+            if (it == g_video_jobs.end()) {
+                callback(error_response("video job not found",
+                                        drogon::k404NotFound));
+                return;
+            }
+            callback(json_response(video_job_json(it->second)));
+        },
+        {drogon::Get});
 
-                auto snap16 = [](int64_t v) {
-                    const int64_t step = 16;
-                    const int64_t lo = 64, hi = 4096;
-                    v = std::max(lo, std::min(hi, (v + step / 2) / step * step));
-                    return v;
-                };
-                if (body.isMember("size") && body["size"].isString()) {
-                    std::string size = body["size"].asString();
-                    auto x = size.find('x');
-                    if (x == std::string::npos) {
-                        throw std::runtime_error(
-                            "'size' must be formatted as \"WxH\", e.g. \"1024x576\"");
-                    }
-                    opts.width = snap16(std::stoll(size.substr(0, x)));
-                    opts.height = snap16(std::stoll(size.substr(x + 1)));
-                } else {
-                    int64_t w = 0, h = 0;
-                    getInt64(body, "width", w);
-                    getInt64(body, "height", h);
-                    if (w > 0) opts.width = snap16(w);
-                    if (h > 0) opts.height = snap16(h);
-                }
-
+    // GET /v1/videos/{id}/content -- download the finished video. ?index=N
+    // selects the Nth output when a job has multiple videos (default 1).
+    app.registerHandler(
+        "/v1/videos/{1}/content",
+        [](const drogon::HttpRequestPtr& req,
+           std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+           const std::string& id) {
+            std::size_t index = 0;
+            const std::string idx = req->getParameter("index");
+            if (!idx.empty()) {
                 try {
-                    const bool has_output_dir = body.isMember("output_dir") &&
-                                               body["output_dir"].isString();
-                    const bool want_url =
-                        body.isMember("response_format") &&
-                        body["response_format"].isString() &&
-                        body["response_format"].asString() == "url";
-                    if (body.isMember("response_format") &&
-                        body["response_format"].isString() &&
-                        body["response_format"].asString() != "b64_json" &&
-                        body["response_format"].asString() != "url") {
-                        throw std::runtime_error(
-                            "'response_format' must be \"b64_json\" or \"url\"");
-                    }
-                    if (body.isMember("output_format") &&
-                        body["output_format"].isString() &&
-                        body["output_format"].asString() != "mp4") {
-                        throw std::runtime_error(
-                            "'output_format' only supports \"mp4\"");
-                    }
-                    const bool save = want_url || has_output_dir;
-                    std::string output_dir;
-                    if (save) {
-                        if (!has_output_dir) {
-                            throw std::runtime_error(
-                                "'response_format' \"url\" requires an "
-                                "'output_dir' to write files into");
-                        }
-                        output_dir = body["output_dir"].asString();
-                    }
+                    index = static_cast<std::size_t>(std::max(1, std::stoi(idx))) - 1;
+                } catch (const std::exception&) {
+                    index = 0;
+                }
+            }
+            std::string path;
+            {
+                std::lock_guard lock(g_video_jobs_mutex);
+                const auto it = g_video_jobs.find(id);
+                if (it == g_video_jobs.end()) {
+                    callback(error_response("video job not found",
+                                            drogon::k404NotFound));
+                    return;
+                }
+                if (it->second.status == VideoJobStatus::completed &&
+                    index < it->second.file_paths.size()) {
+                    path = it->second.file_paths[index];
+                }
+            }
+            if (path.empty()) {
+                callback(error_response("video output is not ready",
+                                        drogon::k404NotFound));
+                return;
+            }
+            std::ifstream fin(path, std::ios::binary);
+            if (!fin) {
+                callback(error_response("video file missing",
+                                        drogon::k404NotFound));
+                return;
+            }
+            std::string bytes((std::istreambuf_iterator<char>(fin)),
+                              std::istreambuf_iterator<char>());
+            callback(bytes_response(std::move(bytes), drogon::CT_VIDEO_MP4));
+        },
+        {drogon::Get});
 
-                    pool().enqueue([model, opts, save, output_dir, callback] {
-                        drogon::HttpResponsePtr resp;
-                        try {
-                            auto results = model->generate(opts);
+    // POST /v1/video/generations -- synchronous, OpenAI-standard response.
+    // Defaults to stored files with fetchable URLs; "response_format":
+    // "b64_json" returns inline base64 instead.
+    app.registerHandler(
+        "/v1/video/generations",
+        [](const drogon::HttpRequestPtr& req,
+           std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+            Json::Value body;
+            try {
+                body = parse_json_body(req);
+            } catch (const std::exception& e) {
+                callback(error_response(e.what(), drogon::k400BadRequest));
+                return;
+            }
+            try {
+                ParsedVideoRequest p = parse_video_request(body);
+                if (!p.model) {
+                    callback(error_response(
+                        "The requested video model is not available. Start the "
+                        "server with --txt2vid or provide a valid 'model' field.",
+                        drogon::k404NotFound));
+                    return;
+                }
+                const bool want_b64 =
+                    body.isMember("response_format") &&
+                    body["response_format"].isString() &&
+                    body["response_format"].asString() == "b64_json";
+                if (body.isMember("response_format") &&
+                    body["response_format"].isString() &&
+                    body["response_format"].asString() != "b64_json" &&
+                    body["response_format"].asString() != "url") {
+                    throw std::runtime_error(
+                        "'response_format' must be \"b64_json\" or \"url\"");
+                }
+                if (body.isMember("output_format") &&
+                    body["output_format"].isString() &&
+                    body["output_format"].asString() != "mp4") {
+                    throw std::runtime_error(
+                        "'output_format' only supports \"mp4\"");
+                }
 
-                            Json::Value data = Json::arrayValue;
+                const std::string id = random_uuid();
+                pool().enqueue([model = p.model, opts = p.opts, id,
+                                num_videos = p.num_videos, want_b64,
+                                size = p.size, seconds = p.seconds,
+                                callback] {
+                    drogon::HttpResponsePtr resp;
+                    try {
+                        Json::Value data = Json::arrayValue;
+                        if (want_b64) {
+                            // Inline base64 without storing files.
+                            const auto results = model->generate(opts);
                             for (std::size_t i = 0; i < results.size(); ++i) {
-                                const auto& video = results[i];
-                                Json::Value item;
-                                if (!save) {
-                                    const std::filesystem::path tmp =
-                                        std::filesystem::temp_directory_path() /
-                                        ("ovserver_vid_" +
-                                         std::to_string(std::time(nullptr)) +
-                                         "_" + std::to_string(i) + ".mp4");
-                                    if (!write_video_mp4(tmp.string(), video)) {
-                                        throw std::runtime_error(
-                                            "encoding MP4 failed (is ffmpeg on "
-                                            "PATH?)");
-                                    }
-                                    std::ifstream fin(
-                                        tmp, std::ios::binary);
-                                    std::string bytes(
-                                        (std::istreambuf_iterator<char>(fin)),
-                                        std::istreambuf_iterator<char>());
-                                    fin.close();
-                                    std::filesystem::remove(tmp);
-                                    item["b64_json"] = base64_encode(
-                                        reinterpret_cast<const std::uint8_t*>(
-                                            bytes.data()),
-                                        bytes.size());
-                                    item["url"] = Json::nullValue;
-                                } else {
-                                    const std::string path =
-                                        output_dir + "/" + "ovserver_" +
-                                        std::to_string(std::time(nullptr)) + "_" +
-                                        std::to_string(i) + ".mp4";
-                                    if (!write_video_mp4(path, video)) {
-                                        throw std::runtime_error(
-                                            "cannot write MP4 to " + path);
-                                    }
-                                    item["b64_json"] = Json::nullValue;
-                                    item["url"] = path;
+                                const std::filesystem::path tmp =
+                                    std::filesystem::temp_directory_path() /
+                                    ("ovserver_vid_" + id + "_" +
+                                     std::to_string(i) + ".mp4");
+                                if (!write_video_mp4(tmp.string(), results[i])) {
+                                    throw std::runtime_error(
+                                        "encoding MP4 failed (is ffmpeg on "
+                                        "PATH?)");
                                 }
+                                std::ifstream fin(tmp, std::ios::binary);
+                                std::string bytes(
+                                    (std::istreambuf_iterator<char>(fin)),
+                                    std::istreambuf_iterator<char>());
+                                fin.close();
+                                std::filesystem::remove(tmp);
+                                Json::Value item;
+                                item["b64_json"] = base64_encode(
+                                    reinterpret_cast<const std::uint8_t*>(
+                                        bytes.data()),
+                                    bytes.size());
+                                item["url"] = Json::nullValue;
+                                item["filename"] =
+                                    id + (i > 0 ? "_" + std::to_string(i + 1)
+                                                : "") +
+                                    ".mp4";
                                 data.append(item);
                             }
-                            Json::Value out;
-                            out["created"] = static_cast<int>(std::time(nullptr));
-                            out["data"] = data;
-                            resp = json_response(out);
-                        } catch (const std::exception& e) {
-                            resp = internal_error_response(e);
+                        } else {
+                            // Store under <id>.mp4 and return fetchable URLs.
+                            {
+                                std::lock_guard lock(g_video_jobs_mutex);
+                                g_video_jobs.emplace(
+                                    id, VideoJob{id, model->id(), opts.prompt,
+                                                 VideoJobStatus::queued,
+                                                 std::time(nullptr), 0, 0.0,
+                                                 "", {}, size, seconds,
+                                                 num_videos});
+                            }
+                            const std::string err = run_video_job(model, opts, id);
+                            if (!err.empty()) {
+                                throw std::runtime_error(err);
+                            }
+                            std::vector<std::string> paths;
+                            {
+                                std::lock_guard lock(g_video_jobs_mutex);
+                                const auto it = g_video_jobs.find(id);
+                                if (it != g_video_jobs.end()) {
+                                    paths = it->second.file_paths;
+                                }
+                            }
+                            for (std::size_t i = 0; i < paths.size(); ++i) {
+                                Json::Value item;
+                                std::string url =
+                                    "/v1/videos/" + id + "/content";
+                                if (i > 0) {
+                                    url += "?index=" + std::to_string(i + 1);
+                                }
+                                item["url"] = url;
+                                item["filename"] =
+                                    std::filesystem::path(paths[i])
+                                        .filename()
+                                        .string();
+                                item["expiry"] =
+                                    static_cast<int>(std::time(nullptr)) + 86400;
+                                item["b64_json"] = Json::nullValue;
+                                data.append(item);
+                            }
                         }
-                        callback(resp);
-                    });
-                } catch (const std::exception& e) {
-                    callback(internal_error_response(e));
-                }
+                        Json::Value out;
+                        out["id"] = id;
+                        out["object"] = "video";
+                        out["created"] = static_cast<int>(std::time(nullptr));
+                        out["model"] = model->id();
+                        out["status"] = "completed";
+                        out["error"] = Json::nullValue;
+                        out["data"] = data;
+                        resp = json_response(out);
+                    } catch (const std::exception& e) {
+                        resp = internal_error_response(e);
+                    }
+                    callback(resp);
+                });
             } catch (const std::exception& e) {
                 callback(error_response(e.what(), drogon::k400BadRequest));
             }
