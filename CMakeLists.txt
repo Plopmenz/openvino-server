@@ -17,16 +17,17 @@ find_package(Threads REQUIRED)
 
 add_executable(openvino-server
     src/main.cc
-    src/image_generation.cc
-    src/manager.cc
-    src/controller.cc
+    src/common.cc
     src/image.cc
     src/image_decode.cc
-    src/text_generation.cc
-    src/video_generation.cc
+    src/txt2img.cc
+    src/manager.cc
+    src/controller.cc
+    src/txt2txt.cc
+    src/txt2vid.cc
     src/audio.cc
-    src/asr.cc
-    src/tts.cc
+    src/wav2txt.cc
+    src/txt2wav.cc
     src/base64.cc
 )
 

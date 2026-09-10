@@ -8,11 +8,11 @@
 #include <string>
 #include <unordered_map>
 
-#include "ovserver/asr.hpp"
-#include "ovserver/image_generation.hpp"
-#include "ovserver/text_generation.hpp"
-#include "ovserver/tts.hpp"
-#include "ovserver/video_generation.hpp"
+#include "ovserver/wav2txt.hpp"
+#include "ovserver/txt2img.hpp"
+#include "ovserver/txt2txt.hpp"
+#include "ovserver/txt2wav.hpp"
+#include "ovserver/txt2vid.hpp"
 
 namespace ovserver {
 

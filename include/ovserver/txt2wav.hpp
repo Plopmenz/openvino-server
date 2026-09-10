@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <openvino/genai/speech_generation/text2speech_pipeline.hpp>
+#include <openvino/runtime/tensor.hpp>
 
 namespace ovserver {
 
@@ -36,7 +37,10 @@ public:
 
     const std::string& id() const { return m_id; }
 
-    TTSResult generate(const std::string& text);
+    const std::filesystem::path& models_path() const { return m_models_path; }
+
+    TTSResult generate(const std::string& text,
+                       const ov::Tensor& speaker_embedding = ov::Tensor());
 
 private:
     std::string m_id;
@@ -45,6 +49,7 @@ private:
 
     std::mutex m_mutex;
     std::shared_ptr<ov::genai::Text2SpeechPipeline> m_pipeline;
+    std::uint64_t m_next_req_id = 0;
 };
 
 struct TTSSpec {

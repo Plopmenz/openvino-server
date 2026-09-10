@@ -28,16 +28,16 @@
 #include <unordered_map>
 #include <vector>
 
-#include "ovserver/asr.hpp"
+#include "ovserver/wav2txt.hpp"
 #include "ovserver/audio.hpp"
 #include "ovserver/base64.hpp"
 #include "ovserver/image.hpp"
 #include "ovserver/image_decode.hpp"
 #include "ovserver/manager.hpp"
-#include "ovserver/tts.hpp"
-#include "ovserver/image_generation.hpp"
-#include "ovserver/text_generation.hpp"
-#include "ovserver/video_generation.hpp"
+#include "ovserver/txt2wav.hpp"
+#include "ovserver/txt2img.hpp"
+#include "ovserver/txt2txt.hpp"
+#include "ovserver/txt2vid.hpp"
 
 namespace ovserver {
 namespace {
@@ -2048,10 +2048,50 @@ void registerAudioSpeech(drogon::HttpAppFramework& app) {
                     return;
                 }
 
-                pool().enqueue([model, text, response_format, callback] {
+                std::string voice;
+                if (body.isMember("voice") && body["voice"].isString()) {
+                    voice = body["voice"].asString();
+                }
+
+                std::shared_ptr<ov::Tensor> speaker_embedding;
+                if (!voice.empty()) {
+                    const std::filesystem::path emb_path =
+                        model->models_path() / "voices" / (voice + ".bin");
+                    std::ifstream fin(emb_path, std::ios::binary);
+                    if (!fin) {
+                        throw std::runtime_error(
+                            "voice '" + voice + "' not found (expected " +
+                            emb_path.string() + ")");
+                    }
+                    fin.seekg(0, std::ios::end);
+                    const std::streamoff size = fin.tellg();
+                    fin.seekg(0, std::ios::beg);
+                    if (size <= 0 || size % 1024 != 0) {
+                        throw std::runtime_error(
+                            "invalid speaker embedding file '" + voice +
+                            ".bin': expected a float32 [N,1,256] tensor");
+                    }
+                    const std::size_t rows =
+                        static_cast<std::size_t>(size) / 1024;
+                    speaker_embedding = std::make_shared<ov::Tensor>(
+                        ov::element::f32, ov::Shape{rows, 1, 256});
+                    fin.read(
+                        reinterpret_cast<char*>(speaker_embedding->data()),
+                        size);
+                    if (!fin) {
+                        throw std::runtime_error(
+                            "failed to read speaker embedding file '" + voice +
+                            ".bin'");
+                    }
+                }
+
+                pool().enqueue([model, text, response_format,
+                                speaker_embedding, callback] {
                     drogon::HttpResponsePtr resp;
                     try {
-                        TTSResult result = model->generate(text);
+                        TTSResult result = model->generate(
+                            text, speaker_embedding ? *speaker_embedding
+                                                    : ov::Tensor{});
                         std::vector<std::uint8_t> raw =
                             wav_pcm16(result.samples, result.sample_rate);
                         resp = bytes_response(

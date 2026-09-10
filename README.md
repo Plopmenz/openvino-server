@@ -68,20 +68,43 @@ cmake --build build
 ## Running
 
 ```sh
-./build/openvino-server --txt2img /models/qwen-image \
-  --txt2txt /models/qwen2.5-vl --device CPU --port 8080
+./build/openvino-server --model /models/qwen-image --txt2img --device CPU \
+  --port 8080
 ```
+
+`--model PATH` names an exported OpenVINO GenAI model directory. The endpoint
+flags (`--txt2img`, `--txt2txt`, `--txt2vid`, `--wav2txt`, `--txt2wav`) enable
+the model at the corresponding endpoint, so a multi-capable model directory can
+be served at several endpoints at once:
+
+```sh
+./build/openvino-server --model /models/qwen3 --txt2txt
+```
+
+Only one `--model` is served per instance; to serve more models, run another
+instance (e.g. on another `--port`). `--model-id` names the id served as
+`model` (default: the model directory name). Requests whose `model` field does
+not match that id exactly are rejected with 404.
 
 Options:
 
 ```
-    --txt2img PATH       Path to an exported image-generation model dir
-                         (repeatable; at least one model required)
-    --txt2img-id ID      Model id served as 'model' (default: qwen-image)
-    --txt2txt PATH       Path to an exported text-generation model dir
-                         (repeatable)
-    --txt2txt-id ID      Model id served as 'model' (default: dir basename)
-    --kv-cache-precision TYPE
+      --model PATH       Path to an exported OpenVINO GenAI model directory
+                         (e.g. Qwen-Image, Qwen2.5-VL, LTX-Video, Qwen3-ASR,
+                         Kokoro). Exactly one; run another instance of the
+                         server to serve more models.
+      --model-id ID      Model id served as 'model' (default: the directory
+                         name).
+      --txt2img          Serve the model on /v1/images/generations (image
+                         generation).
+      --txt2txt          Serve the model on /v1/chat/completions (text
+                         generation).
+      --txt2vid          Serve the model on /v1/videos and
+                         /v1/video/generations (video generation).
+      --wav2txt          Serve the model on /v1/audio/transcriptions (speech
+                         recognition).
+      --txt2wav          Serve the model on /v1/audio/speech (text-to-speech).
+      --kv-cache-precision TYPE
                          KV cache element type for text models on GPU
                          (default: u8)
     --dynamic-quant-gsize N
@@ -105,17 +128,6 @@ Options:
                          Prediction) head. Models exported with
                          openvino_mtp_model.xml (e.g. Qwen3.6/3.8) enable MTP
                          speculative decoding automatically.
-    --txt2vid PATH       Path to an exported video-generation model dir (e.g.
-                         LTX-Video); serves /v1/video/generations (repeatable)
-    --txt2vid-id ID      Model id served as 'model' (default: dir basename)
-    --wav2txt PATH       Path to an exported speech-recognition model dir (e.g.
-                         Qwen3-ASR, Whisper); serves /v1/audio/transcriptions
-                         (repeatable)
-    --wav2txt-id ID      Model id served as 'model' (default: dir basename)
-    --txt2wav PATH       Path to an exported text-to-speech model dir (e.g.
-                         SpeechT5, Kokoro); serves /v1/audio/speech
-                         (repeatable)
-    --txt2wav-id ID      Model id served as 'model' (default: dir basename)
     --ffmpeg PATH        ffmpeg binary for audio decode / MP4 encode
                          (default: "ffmpeg" on PATH; empty disables those)
 -d, --device DEVICE      OpenVINO device (default: CPU)

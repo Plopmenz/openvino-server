@@ -76,6 +76,7 @@ private:
 
     std::mutex m_mutex;
     std::shared_ptr<ov::genai::ASRPipeline> m_pipeline;
+    std::uint64_t m_next_req_id = 0;
 };
 
 struct ASRSpec {

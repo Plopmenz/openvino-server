@@ -1,7 +1,7 @@
 // Copyright (C) 2026
 // SPDX-License-Identifier: Apache-2.0
 
-#include "ovserver/video_generation.hpp"
+#include "ovserver/txt2vid.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -11,56 +11,18 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
+#include <functional>
 #include <iostream>
 #include <sstream>
 
-#include <openvino/runtime/intel_gpu/properties.hpp>
-#include <openvino/runtime/properties.hpp>
 #include <openvino/genai/image_generation/generation_config.hpp>
 #include <openvino/genai/video_generation/generation_config.hpp>
-#include <openvino/runtime/core.hpp>
 
 #include "ovserver/audio.hpp"
+#include "ovserver/common.hpp"
 
 namespace ovserver {
 namespace {
-
-std::size_t proc_field_kb(const std::string& field) {
-    std::ifstream status("/proc/self/status");
-    if (!status) {
-        return 0;
-    }
-    std::string line;
-    while (std::getline(status, line)) {
-        if (line.rfind(field, 0) == 0) {
-            const std::size_t pos = line.find_first_of("0123456789");
-            if (pos != std::string::npos) {
-                return static_cast<std::size_t>(std::stoull(line.substr(pos)));
-            }
-        }
-    }
-    return 0;
-}
-
-// Total GPU device memory currently allocated by the plugin, in MiB.
-// Returns -1 when not applicable (non-GPU device, plugin unavailable).
-double device_gpu_mib(const std::string& device) {
-    if (device.find("GPU") == std::string::npos) {
-        return -1.0;
-    }
-    try {
-        ov::Core core;
-        auto stats = core.get_property(device, ov::intel_gpu::memory_statistics);
-        std::uint64_t bytes = 0;
-        for (const auto& [name, value] : stats) {
-            bytes += value;
-        }
-        return static_cast<double>(bytes) / (1024.0 * 1024.0);
-    } catch (const std::exception&) {
-        return -1.0;
-    }
-}
 
 std::string shell_quote(const std::string& value) {
     std::string out;
@@ -237,46 +199,18 @@ VideoGenerationModel::VideoGenerationModel(
     const std::string& device,
     const std::string& cache_dir)
     : m_id(id), m_models_path(models_path), m_device(device) {
-    const auto t0 = std::chrono::steady_clock::now();
-    std::cerr << "[video model '" << id << "'] loading from " << m_models_path
-              << " on " << m_device << " ..." << std::endl;
-    ov::AnyMap properties;
-    if (m_device.find("GPU") != std::string::npos) {
-        properties.emplace(ov::hint::kv_cache_precision(ov::element::u8));
-        properties.emplace(
-            ov::hint::dynamic_quantization_group_size(std::uint64_t{32}));
-        properties.emplace(
-            ov::intel_gpu::hint::enable_sdpa_optimization(true));
-    }
-    if (!cache_dir.empty()) {
-        properties.emplace(ov::cache_dir(cache_dir));
-    }
+    PipelineLoadLog load_log("video", id, m_models_path, m_device);
     try {
         m_pipeline =
-            std::make_shared<ov::genai::Text2VideoPipeline>(m_models_path.string(),
-                                                            m_device, properties);
+            std::make_shared<ov::genai::Text2VideoPipeline>(
+                m_models_path.string(), m_device,
+                inference_properties(m_device, cache_dir));
     } catch (const std::exception& e) {
         std::cerr << "[video model '" << id << "'] loading FAILED: " << e.what()
                   << std::endl;
         throw;
     }
-    const auto load_s = std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - t0)
-                            .count();
-    std::cerr << "[video model '" << id << "'] loaded in " << load_s
-              << " s" << std::endl;
-    std::cerr << "[video model '" << id << "'] memory: ";
-    const double gpu_mib = device_gpu_mib(m_device);
-    if (gpu_mib >= 0.0) {
-        std::cerr << "GPU " << std::fixed << std::setprecision(2)
-                  << (gpu_mib / 1024.0) << " GiB" << std::endl;
-    } else if (m_device.find("GPU") != std::string::npos) {
-        std::cerr << "GPU ??? GiB" << std::endl;
-    } else {
-        std::cerr << "CPU " << std::fixed << std::setprecision(2)
-                  << (proc_field_kb("VmRSS:") / (1024.0 * 1024.0)) << " GiB"
-                  << std::endl;
-    }
+    load_log.completion();
 }
 
 VideoGenerationModel::~VideoGenerationModel() = default;
@@ -285,6 +219,9 @@ std::vector<VideoResult> VideoGenerationModel::generate(
     const VideoGenerateOptions& opts) {
     const std::uint64_t req_id = m_next_req_id.fetch_add(1);
     const auto start = std::chrono::steady_clock::now();
+
+    std::cerr << "[video model '" << m_id << "'] request " << req_id
+              << " start" << std::endl;
 
     ov::AnyMap properties;
     properties[ov::genai::num_videos_per_prompt.name()] = opts.num_videos;
@@ -316,7 +253,20 @@ std::vector<VideoResult> VideoGenerationModel::generate(
                 static_cast<std::uint32_t>(*opts.rng_seed));
     }
 
-    std::cerr << "video gen start: prompt=" << opts.prompt << std::endl;
+    // Log each denoising step's duration individually as it completes.
+    properties[ov::genai::callback.name()] =
+        std::function<bool(size_t, size_t, ov::Tensor&)>(
+            [this, req_id, last = start](size_t step, size_t total,
+                                         ov::Tensor&) mutable -> bool {
+                const auto now = std::chrono::steady_clock::now();
+                const auto step_s =
+                    std::chrono::duration<double>(now - last).count();
+                last = now;
+                std::cerr << "[video model '" << m_id << "'] request " << req_id
+                          << " step " << step + 1 << "/" << total << ": "
+                          << step_s << " s" << std::endl;
+                return false;
+            });
 
     const ov::genai::VideoGenerationResult result = [&]() {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -359,22 +309,27 @@ std::vector<VideoResult> VideoGenerationModel::generate(
                 f = resize_frame(f, out_w, out_h);
             }
         }
-        const double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        const double elapsed = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - start)
                                    .count();
-        std::cerr << "video gen done: req=" << req_id << " ms=" << elapsed
-                  << " videos=" << num_videos << " frames=" << num_frames
-                  << " decoded=" << height << "x" << width
-                  << " output=" << out_h << "x" << out_w << std::endl;
+        const double video_s =
+            static_cast<double>(num_frames) / static_cast<double>(fps);
+        std::cerr << "[video model '" << m_id << "'] request " << req_id
+                  << " finished in " << elapsed << " s resolution=" << out_w
+                  << "x" << out_h << " video_s=" << video_s << " fps=" << fps
+                  << std::endl;
         return videos;
     }
 
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - start)
-                             .count();
-    std::cerr << "video gen done: req=" << req_id << " ms=" << elapsed
-              << " videos=" << num_videos << " frames=" << num_frames
-              << " h=" << height << " w=" << width << std::endl;
+    const double elapsed = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - start)
+                               .count();
+    const double video_s =
+        static_cast<double>(num_frames) / static_cast<double>(fps);
+    std::cerr << "[video model '" << m_id << "'] request " << req_id
+              << " finished in " << elapsed << " s resolution=" << width
+              << "x" << height << " video_s=" << video_s << " fps=" << fps
+              << std::endl;
     return videos;
 }
 

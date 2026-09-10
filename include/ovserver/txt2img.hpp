@@ -4,15 +4,12 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
-#include <unordered_map>
 #include <vector>
 
 #include <openvino/genai/image_generation/text2image_pipeline.hpp>
@@ -62,16 +59,6 @@ public:
     std::vector<ImageResult> generate(const ImageGenerateOptions& opts);
 
 private:
-    void snapshot_run();
-
-    // Per-request diffusion timing. The pipeline callback records the duration
-    // of the just-completed step; the snapshot thread averages the latest
-    // s/step across running requests once per second.
-    struct StepStats {
-        std::size_t steps = 0;
-        double last_step_s = 0.0;
-    };
-
     std::string m_id;
     std::filesystem::path m_models_path;
     std::string m_device;
@@ -79,13 +66,7 @@ private:
     std::mutex m_mutex;
     std::shared_ptr<ov::genai::Text2ImagePipeline> m_pipeline;
 
-    std::thread m_snapshot_thread;
-    std::atomic<bool> m_stop{false};
     std::atomic<std::uint64_t> m_next_req_id{0};
-
-    std::mutex m_metrics_mutex;
-    std::unordered_map<std::uint64_t, StepStats> m_steps;
-    std::chrono::steady_clock::time_point m_last_snapshot;
 };
 
 struct ImageGenerationSpec {

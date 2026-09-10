@@ -11,34 +11,39 @@
 
 #include <openvino/runtime/core.hpp>
 
-#include "ovserver/asr.hpp"
+#include "ovserver/wav2txt.hpp"
 #include "ovserver/audio.hpp"
 #include "ovserver/controller.hpp"
 #include "ovserver/manager.hpp"
-#include "ovserver/tts.hpp"
+#include "ovserver/txt2wav.hpp"
 
 namespace {
 
 void usage(const char* argv0) {
     std::cerr
-        << "openvino-server: serve image generation (/v1/images/generations)\n"
-        << "and text generation (/v1/chat/completions) models over an\n"
-        << "OpenAI-compatible HTTP API.\n\n"
+        << "openvino-server: serve image, text, video, speech-recognition and\n"
+        << "text-to-speech OpenVINO GenAI models over an OpenAI-compatible\n"
+        << "HTTP API.\n\n"
         << "Usage: " << argv0 << " [options]\n\n"
         << "Options:\n"
-        << "      --txt2img PATH      Path to an exported OpenVINO GenAI image\n"
-        << "                          generation model (e.g. Qwen-Image). May be\n"
-        << "                          repeated.\n"
-        << "      --txt2img-id ID     Model id reported via /v1/models and the\n"
-        << "                          'model' request field. Default: 'qwen-image'.\n"
-        << "                          When multiple image models are given each\n"
-        << "                          requires an id.\n"
-        << "      --txt2txt PATH      Path to an exported OpenVINO GenAI text\n"
-        << "                          generation model (e.g. Qwen2.5-VL,\n"
-        << "                          Qwen3-VL). May be repeated.\n"
-        << "      --txt2txt-id ID     Model id for the corresponding --txt2txt.\n"
-        << "                          Default: the directory basename. When multiple\n"
-        << "                          text models are given each requires an id.\n"
+        << "      --model PATH       Path to an exported OpenVINO GenAI model\n"
+        << "                          directory (e.g. Qwen-Image, Qwen2.5-VL,\n"
+        << "                          LTX-Video, Qwen3-ASR, Kokoro). Exactly\n"
+        << "                          one; run another instance of the server\n"
+        << "                          to serve more models.\n"
+        << "      --model-id ID       Model id reported via /v1/models and the\n"
+        << "                          'model' request field. Default: the model\n"
+        << "                          directory name.\n"
+        << "      --txt2img           Serve the model on /v1/images/generations\n"
+        << "                          (image generation).\n"
+        << "      --txt2txt           Serve the model on /v1/chat/completions\n"
+        << "                          (text generation).\n"
+        << "      --txt2vid           Serve the model on /v1/videos and\n"
+        << "                          /v1/video/generations (video generation).\n"
+        << "      --wav2txt           Serve the model on /v1/audio/transcriptions\n"
+        << "                          (speech recognition).\n"
+        << "      --txt2wav           Serve the model on /v1/audio/speech\n"
+        << "                          (text-to-speech).\n"
         << "      --kv-cache-precision TYPE\n"
         << "                          KV cache element type for text models on GPU.\n"
         << "                          Default: u8.\n"
@@ -68,24 +73,6 @@ void usage(const char* argv0) {
         << "                          directory contains openvino_mtp_model.xml,\n"
         << "                          MTP speculative decoding is enabled\n"
         << "                          automatically.\n"
-        << "      --txt2vid PATH      Path to an exported OpenVINO GenAI video\n"
-        << "                          generation model (e.g. LTX-Video). May be\n"
-        << "                          repeated.\n"
-        << "      --txt2vid-id ID     Model id for the corresponding --txt2vid.\n"
-        << "                          Default: the directory basename. When multiple\n"
-        << "                          video models are given each requires an id.\n"
-        << "      --wav2txt PATH      Path to an exported OpenVINO GenAI speech\n"
-        << "                          recognition model (e.g. Qwen3-ASR, Whisper).\n"
-        << "                          May be repeated.\n"
-        << "      --wav2txt-id ID     Model id for the corresponding --wav2txt.\n"
-        << "                          Default: the directory basename. When multiple\n"
-        << "                          ASR models are given each requires an id.\n"
-        << "      --txt2wav PATH      Path to an exported OpenVINO GenAI text-to-\n"
-        << "                          speech model (e.g. SpeechT5, Kokoro). May be\n"
-        << "                          repeated.\n"
-        << "      --txt2wav-id ID     Model id for the corresponding --txt2wav.\n"
-        << "                          Default: the directory basename. When multiple\n"
-        << "                          TTS models are given each requires an id.\n"
         << "      --ffmpeg PATH       Path to the ffmpeg binary used to decode\n"
         << "                          uploaded audio and encode generated video.\n"
         << "                          Default: 'ffmpeg' on PATH. Set to an empty\n"
@@ -126,16 +113,13 @@ std::string get_arg(int argc, char** argv, int& i, const char* flag) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::vector<std::string> image_models;
-    std::vector<std::string> image_model_ids;
-    std::vector<std::string> text_models;
-    std::vector<std::string> text_model_ids;
-    std::vector<std::string> video_models;
-    std::vector<std::string> video_model_ids;
-    std::vector<std::string> asr_models;
-    std::vector<std::string> asr_model_ids;
-    std::vector<std::string> tts_models;
-    std::vector<std::string> tts_model_ids;
+    std::string model_path;
+    std::string model_id;
+    bool enable_txt2img = false;
+    bool enable_txt2txt = false;
+    bool enable_txt2vid = false;
+    bool enable_wav2txt = false;
+    bool enable_txt2wav = false;
     std::string device = "CPU";
     std::string host = "0.0.0.0";
     int port = 8080;
@@ -159,26 +143,29 @@ int main(int argc, char** argv) {
     try {
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
-            if (a == "--txt2img") {
-                image_models.push_back(get_arg(argc, argv, i, a.c_str()));
-            } else if (a == "--txt2img-id") {
-                image_model_ids.push_back(get_arg(argc, argv, i, a.c_str()));
+            if (a == "--model") {
+                if (!model_path.empty()) {
+                    throw std::runtime_error(
+                        "only one --model is supported; run another "
+                        "instance of openvino-server to serve more models");
+                }
+                model_path = get_arg(argc, argv, i, a.c_str());
+            } else if (a == "--model-id") {
+                if (!model_id.empty()) {
+                    throw std::runtime_error(
+                        "--model-id must be supplied at most once");
+                }
+                model_id = get_arg(argc, argv, i, a.c_str());
+            } else if (a == "--txt2img") {
+                enable_txt2img = true;
             } else if (a == "--txt2txt") {
-                text_models.push_back(get_arg(argc, argv, i, a.c_str()));
-            } else if (a == "--txt2txt-id") {
-                text_model_ids.push_back(get_arg(argc, argv, i, a.c_str()));
+                enable_txt2txt = true;
             } else if (a == "--txt2vid") {
-                video_models.push_back(get_arg(argc, argv, i, a.c_str()));
-            } else if (a == "--txt2vid-id") {
-                video_model_ids.push_back(get_arg(argc, argv, i, a.c_str()));
+                enable_txt2vid = true;
             } else if (a == "--wav2txt") {
-                asr_models.push_back(get_arg(argc, argv, i, a.c_str()));
-            } else if (a == "--wav2txt-id") {
-                asr_model_ids.push_back(get_arg(argc, argv, i, a.c_str()));
+                enable_wav2txt = true;
             } else if (a == "--txt2wav") {
-                tts_models.push_back(get_arg(argc, argv, i, a.c_str()));
-            } else if (a == "--txt2wav-id") {
-                tts_model_ids.push_back(get_arg(argc, argv, i, a.c_str()));
+                enable_txt2wav = true;
             } else if (a == "--ffmpeg") {
                 ffmpeg = get_arg(argc, argv, i, a.c_str());
             } else if (a == "--cache-dir") {
@@ -245,51 +232,16 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    if (image_models.empty() && text_models.empty() && video_models.empty() &&
-        asr_models.empty() && tts_models.empty()) {
-        std::cerr << "error: at least one of --txt2img, --txt2txt, --txt2vid, "
-                     "--wav2txt or --txt2wav PATH is required\n";
+    if (model_path.empty()) {
+        std::cerr << "error: --model PATH is required\n";
         usage(argv[0]);
         return 2;
     }
-    if (!image_model_ids.empty() && image_model_ids.size() != image_models.size()) {
-        std::cerr << "error: --txt2img-id must be supplied for every --txt2img\n";
-        return 2;
-    }
-    if (image_models.empty() && !image_model_ids.empty()) {
-        std::cerr << "error: --txt2img-id given but no --txt2img\n";
-        return 2;
-    }
-    if (!text_model_ids.empty() && text_model_ids.size() != text_models.size()) {
-        std::cerr << "error: --txt2txt-id must be supplied for every --txt2txt\n";
-        return 2;
-    }
-    if (text_models.empty() && !text_model_ids.empty()) {
-        std::cerr << "error: --txt2txt-id given but no --txt2txt\n";
-        return 2;
-    }
-    if (!video_model_ids.empty() && video_model_ids.size() != video_models.size()) {
-        std::cerr << "error: --txt2vid-id must be supplied for every --txt2vid\n";
-        return 2;
-    }
-    if (video_models.empty() && !video_model_ids.empty()) {
-        std::cerr << "error: --txt2vid-id given but no --txt2vid\n";
-        return 2;
-    }
-    if (!asr_model_ids.empty() && asr_model_ids.size() != asr_models.size()) {
-        std::cerr << "error: --wav2txt-id must be supplied for every --wav2txt\n";
-        return 2;
-    }
-    if (asr_models.empty() && !asr_model_ids.empty()) {
-        std::cerr << "error: --wav2txt-id given but no --wav2txt\n";
-        return 2;
-    }
-    if (!tts_model_ids.empty() && tts_model_ids.size() != tts_models.size()) {
-        std::cerr << "error: --txt2wav-id must be supplied for every --txt2wav\n";
-        return 2;
-    }
-    if (tts_models.empty() && !tts_model_ids.empty()) {
-        std::cerr << "error: --txt2wav-id given but no --txt2wav\n";
+    if (!enable_txt2img && !enable_txt2txt && !enable_txt2vid &&
+        !enable_wav2txt && !enable_txt2wav) {
+        std::cerr << "error: at least one of --txt2img, --txt2txt, --txt2vid, "
+                     "--wav2txt or --txt2wav is required\n";
+        usage(argv[0]);
         return 2;
     }
 
@@ -354,20 +306,15 @@ int main(int argc, char** argv) {
     }
 
     try {
-        for (size_t i = 0; i < image_models.size(); ++i) {
-            auto id = image_model_ids.empty() ? std::string("qwen-image")
-                                              : image_model_ids[i];
-            ovserver::ModelManager::instance().load_image(
-                id, {std::filesystem::path(image_models[i]), device,
-                     cache_dir});
+        const std::filesystem::path p(model_path);
+        const std::string id =
+            model_id.empty() ? p.filename().string() : model_id;
+        if (enable_txt2img) {
+            ovserver::ModelManager::instance().load_image(id, {p, device, cache_dir});
             LOG_INFO << "Image model '" << id
                      << "' ready at /v1/images/generations";
         }
-
-        for (size_t i = 0; i < text_models.size(); ++i) {
-            const std::filesystem::path p(text_models[i]);
-            auto id = text_model_ids.empty() ? p.filename().string()
-                                             : text_model_ids[i];
+        if (enable_txt2txt) {
             ovserver::ModelManager::instance().load_text(
                 id, {p,
                      device,
@@ -384,34 +331,19 @@ int main(int argc, char** argv) {
             LOG_INFO << "Text model '" << id
                      << "' ready at /v1/chat/completions";
         }
-
-        for (size_t i = 0; i < video_models.size(); ++i) {
-            const std::filesystem::path p(video_models[i]);
-            auto id = video_model_ids.empty() ? p.filename().string()
-                                              : video_model_ids[i];
-            ovserver::ModelManager::instance().load_video(
-                id, {p, device, cache_dir});
+        if (enable_txt2vid) {
+            ovserver::ModelManager::instance().load_video(id, {p, device, cache_dir});
             LOG_INFO << "Video model '" << id
                      << "' ready at /v1/videos "
                         "(async) and /v1/video/generations (sync)";
         }
-
-        for (size_t i = 0; i < asr_models.size(); ++i) {
-            const std::filesystem::path p(asr_models[i]);
-            auto id = asr_model_ids.empty() ? p.filename().string()
-                                            : asr_model_ids[i];
-            ovserver::ModelManager::instance().load_asr(
-                id, {p, device, cache_dir});
+        if (enable_wav2txt) {
+            ovserver::ModelManager::instance().load_asr(id, {p, device, cache_dir});
             LOG_INFO << "ASR model '" << id
                      << "' ready at /v1/audio/transcriptions";
         }
-
-        for (size_t i = 0; i < tts_models.size(); ++i) {
-            const std::filesystem::path p(tts_models[i]);
-            auto id = tts_model_ids.empty() ? p.filename().string()
-                                            : tts_model_ids[i];
-            ovserver::ModelManager::instance().load_tts(
-                id, {p, device, cache_dir});
+        if (enable_txt2wav) {
+            ovserver::ModelManager::instance().load_tts(id, {p, device, cache_dir});
             LOG_INFO << "TTS model '" << id
                      << "' ready at /v1/audio/speech";
         }

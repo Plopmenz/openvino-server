@@ -1,13 +1,12 @@
 // Copyright (C) 2026
 // SPDX-License-Identifier: Apache-2.0
 
-#include "ovserver/text_generation.hpp"
+#include "ovserver/txt2txt.hpp"
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -17,49 +16,12 @@
 
 #include <openvino/genai/llm_pipeline.hpp>
 #include <openvino/genai/text_streamer.hpp>
-#include <openvino/runtime/core.hpp>
-#include <openvino/runtime/intel_gpu/properties.hpp>
-#include <openvino/runtime/properties.hpp>
+
+#include "ovserver/common.hpp"
 
 namespace ovserver {
 
 namespace {
-
-std::size_t proc_field_kb(const std::string& field) {
-    std::ifstream status("/proc/self/status");
-    if (!status) {
-        return 0;
-    }
-    std::string line;
-    while (std::getline(status, line)) {
-        if (line.rfind(field, 0) == 0) {
-            const std::size_t pos = line.find_first_of("0123456789");
-            if (pos != std::string::npos) {
-                return static_cast<std::size_t>(std::stoull(line.substr(pos)));
-            }
-        }
-    }
-    return 0;
-}
-
-// Total GPU device memory currently allocated by the plugin, in MiB.
-// Returns -1 when not applicable (non-GPU device, plugin unavailable).
-double device_gpu_mib(const std::string& device) {
-    if (device.find("GPU") == std::string::npos) {
-        return -1.0;
-    }
-    try {
-        ov::Core core;
-        auto stats = core.get_property(device, ov::intel_gpu::memory_statistics);
-        std::uint64_t bytes = 0;
-        for (const auto& [name, value] : stats) {
-            bytes += value;
-        }
-        return static_cast<double>(bytes) / (1024.0 * 1024.0);
-    } catch (const std::exception&) {
-        return -1.0;
-    }
-}
 
 std::string finish_reason_str(ov::genai::GenerationFinishReason r) {
     switch (r) {
@@ -463,31 +425,17 @@ const char* ascii_lower(std::string& s) {
 TextGenerationModel::TextGenerationModel(const std::string& id,
     const TextGenerationSpec& spec)
     : m_id(id), m_models_path(spec.path), m_device(spec.device) {
-    const auto t0 = std::chrono::steady_clock::now();
-    std::cerr << "[text model '" << id << "'] loading from " << m_models_path
-              << " on " << m_device << " ..." << std::endl;
+    PipelineLoadLog load_log("text", id, m_models_path, m_device);
 
     ov::genai::SchedulerConfig sched_cfg;
     sched_cfg.cache_interval_multiplier = spec.cache_interval_multiplier;
     sched_cfg.enable_prefix_caching = spec.enable_prefix_caching;
     try {
-        // GPU device properties are passed through the head-compile property
-        // map (forwarded to ov::Core::compile_model by the pipeline). For
-        // non-GPU devices they would be rejected, so they are only set on GPU.
-        ov::AnyMap props;
-        if (!spec.cache_dir.empty()) {
-            props.emplace(ov::cache_dir(spec.cache_dir));
-        }
-        if (m_device.find("GPU") != std::string::npos) {
-            props.emplace(
-                ov::hint::kv_cache_precision(ov::element::Type(spec.kv_cache_precision)));
-            props.emplace(
-                ov::hint::dynamic_quantization_group_size(
-                    spec.dynamic_quant_group_size));
-            props.emplace(
-                ov::intel_gpu::hint::enable_sdpa_optimization(
-                    spec.enable_sdpa_optimization));
-        }
+        GpuTuning gpu;
+        gpu.kv_cache_precision = ov::element::Type(spec.kv_cache_precision);
+        gpu.dynamic_quantization_group_size = spec.dynamic_quant_group_size;
+        gpu.enable_sdpa_optimization = spec.enable_sdpa_optimization;
+        ov::AnyMap props = inference_properties(m_device, spec.cache_dir, gpu);
         // Speculative decoding: prompt-lookup drafts candidates by n-gram
         // matching against the prompt (no extra model); otherwise if the model
         // ships a bundled MTP head (openvino_mtp_model.xml) it is used for
@@ -521,23 +469,7 @@ TextGenerationModel::TextGenerationModel(const std::string& id,
                   << std::endl;
         throw;
     }
-    const auto load_s = std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - t0)
-                            .count();
-    std::cerr << "[text model '" << id << "'] loaded in " << load_s
-              << " s" << std::endl;
-    std::cerr << "[text model '" << id << "'] memory: ";
-    const double gpu_mib = device_gpu_mib(m_device);
-    if (gpu_mib >= 0.0) {
-        std::cerr << "GPU " << std::fixed << std::setprecision(2)
-                  << (gpu_mib / 1024.0) << " GiB" << std::endl;
-    } else if (m_device.find("GPU") != std::string::npos) {
-        std::cerr << "GPU ??? GiB" << std::endl;
-    } else {
-        std::cerr << "CPU " << std::fixed << std::setprecision(2)
-                  << (proc_field_kb("VmRSS:") / (1024.0 * 1024.0)) << " GiB"
-                  << std::endl;
-    }
+    load_log.completion();
     m_last_snapshot = std::chrono::steady_clock::now();
     m_executor = std::thread([this] { executor_run(); });
 }
