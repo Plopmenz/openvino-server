@@ -13,6 +13,7 @@
 
 #include "ovserver/wav2txt.hpp"
 #include "ovserver/audio.hpp"
+#include "ovserver/common.hpp"
 #include "ovserver/controller.hpp"
 #include "ovserver/manager.hpp"
 #include "ovserver/txt2wav.hpp"
@@ -86,7 +87,11 @@ void usage(const char* argv0) {
         << "                          UUID as file name, returned to the client as\n"
         << "                          the video id. Default: system temp dir.\n"
         << "  -d, --device DEVICE     OpenVINO device (CPU, GPU, AUTO, ...).\n"
-        << "                          Default: CPU.\n"
+        << "                          Default: AUTO.\n"
+        << "      --second-device DEVICE\n"
+        << "                          Device for the text model's bundled MTP\n"
+        << "                          draft head when speculative decoding is\n"
+        << "                          active. Defaults to --device.\n"
         << "  -h, --host HOST         Listen address. Default: 0.0.0.0\n"
         << "  -p, --port PORT         Listen port. Default: 8080.\n"
         << "  -t, --threads N         Number of event-loop threads. Default: 4.\n"
@@ -120,7 +125,8 @@ int main(int argc, char** argv) {
     bool enable_txt2vid = false;
     bool enable_wav2txt = false;
     bool enable_txt2wav = false;
-    std::string device = "CPU";
+    std::string device = "AUTO";
+    std::string second_device;
     std::string host = "0.0.0.0";
     int port = 8080;
     int threads = 4;
@@ -174,6 +180,8 @@ int main(int argc, char** argv) {
                 temp_dir = get_arg(argc, argv, i, a.c_str());
             } else if (a == "-d" || a == "--device") {
                 device = get_arg(argc, argv, i, a.c_str());
+            } else if (a == "--second-device") {
+                second_device = get_arg(argc, argv, i, a.c_str());
             } else if (a == "-h" || a == "--host") {
                 host = get_arg(argc, argv, i, a.c_str());
             } else if (a == "-p" || a == "--port") {
@@ -327,7 +335,8 @@ int main(int argc, char** argv) {
                      num_assistant_tokens,
                      max_ngram_size,
                      enable_mtp,
-                     cache_dir});
+                     cache_dir,
+                     second_device});
             LOG_INFO << "Text model '" << id
                      << "' ready at /v1/chat/completions";
         }

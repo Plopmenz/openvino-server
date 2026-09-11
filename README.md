@@ -130,7 +130,11 @@ Options:
                          speculative decoding automatically.
     --ffmpeg PATH        ffmpeg binary for audio decode / MP4 encode
                          (default: "ffmpeg" on PATH; empty disables those)
--d, --device DEVICE      OpenVINO device (default: CPU)
+-d, --device DEVICE      OpenVINO device, e.g. CPU, GPU, NPU (default: AUTO,
+                         letting OpenVINO pick the most appropriate device)
+        --second-device DEVICE
+                         Device for a text model's bundled MTP draft head when
+                         speculative decoding is active (default: --device).
 -h, --host HOST          Listen address (default: 0.0.0.0)
 -p, --port PORT          Listen port (default: 8080)
 -t, --threads N          Drogon event-loop threads (default: 4)

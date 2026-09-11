@@ -3,14 +3,17 @@
 
 #include "ovserver/common.hpp"
 
+#include <algorithm>
 #include <exception>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <utility>
+#include <vector>
 
 #include <openvino/runtime/core.hpp>
 #include <openvino/runtime/intel_gpu/properties.hpp>
+#include <openvino/runtime/intel_npu/properties.hpp>
 
 namespace ovserver {
 
@@ -54,6 +57,22 @@ double device_gpu_mib(const std::string& device) {
     }
 }
 
+// Total NPU DDR memory currently allocated, in MiB.
+// Returns -1.0 when not applicable (non-NPU device, plugin unavailable).
+double device_npu_mib(const std::string& device) {
+    if (device.find("NPU") == std::string::npos) {
+        return -1.0;
+    }
+    try {
+        ov::Core core;
+        const std::uint64_t bytes =
+            core.get_property(device, ov::intel_npu::device_alloc_mem_size);
+        return static_cast<double>(bytes) / (1024.0 * 1024.0);
+    } catch (const std::exception&) {
+        return -1.0;
+    }
+}
+
 }  // namespace
 
 ov::AnyMap inference_properties(const std::string& device,
@@ -66,41 +85,75 @@ ov::AnyMap inference_properties(const std::string& device,
     if (device.find("GPU") == std::string::npos) {
         return properties;
     }
-    properties.emplace(ov::hint::kv_cache_precision(gpu.kv_cache_precision));
-    properties.emplace(
-        ov::hint::dynamic_quantization_group_size(
-            gpu.dynamic_quantization_group_size));
-    properties.emplace(
-        ov::intel_gpu::hint::enable_sdpa_optimization(
-            gpu.enable_sdpa_optimization));
+    // Wrap GPU-specific hints in ov::device::properties so they are scoped to
+    // the GPU device.  GenAI forwards the full property map to the draft model
+    // compile call; without device-scoping the CPU plugin rejects unknown
+    // GPU-specific keys.
+    ov::AnyMap gpu_props;
+    properties.emplace(ov::device::properties("GPU", gpu_props));
     return properties;
 }
 
 void log_model_memory(const std::string& tag,
                       const std::string& id,
-                      const std::string& device) {
+                      const std::vector<std::string>& devices) {
     std::cerr << "[" << tag << " model '" << id << "'] memory: ";
-    const double gpu_mib = device_gpu_mib(device);
-    if (gpu_mib >= 0.0) {
-        std::cerr << "GPU " << std::fixed << std::setprecision(2)
-                  << (gpu_mib / 1024.0) << " GiB" << std::endl;
-    } else if (device.find("GPU") != std::string::npos) {
-        std::cerr << "GPU ??? GiB" << std::endl;
-    } else {
-        std::cerr << "CPU " << std::fixed << std::setprecision(2)
-                  << (proc_field_kb("VmRSS:") / (1024.0 * 1024.0)) << " GiB"
-                  << std::endl;
+    std::vector<std::string> seen;
+    bool first = true;
+    for (const auto& device : devices) {
+        if (std::find(seen.begin(), seen.end(), device) != seen.end()) {
+            continue;
+        }
+        seen.push_back(device);
+
+        bool unknown = false;
+        double gib = -1.0;
+        std::string label;
+        const double gpu_mib = device_gpu_mib(device);
+        if (gpu_mib >= 0.0) {
+            label = "GPU";
+            gib = gpu_mib / 1024.0;
+        } else if (device.find("GPU") != std::string::npos) {
+            label = "GPU";
+            unknown = true;
+        } else {
+            const double npu_mib = device_npu_mib(device);
+            if (npu_mib >= 0.0) {
+                label = "NPU";
+                gib = npu_mib / 1024.0;
+            } else if (device.find("NPU") != std::string::npos) {
+                label = "NPU";
+                unknown = true;
+            } else {
+                label = "CPU";
+                gib = proc_field_kb("VmRSS:") / (1024.0 * 1024.0);
+            }
+        }
+
+        if (!first) {
+            std::cerr << ", ";
+        }
+        first = false;
+        std::cerr << label << " ";
+        if (unknown) {
+            std::cerr << "??? GiB";
+        } else {
+            std::cerr << std::fixed << std::setprecision(2) << gib << " GiB";
+        }
     }
+    std::cerr << std::endl;
 }
 
 PipelineLoadLog::PipelineLoadLog(std::string tag,
                                  std::string id,
                                  const std::filesystem::path& path,
-                                 std::string device)
+                                 std::string device,
+                                 std::string second_device)
     : m_tag(std::move(tag)),
       m_id(std::move(id)),
       m_path(path),
       m_device(std::move(device)),
+      m_second_device(std::move(second_device)),
       m_t0(std::chrono::steady_clock::now()) {
     std::cerr << "[" << m_tag << " model '" << m_id << "'] loading from "
               << m_path << " on " << m_device << " ..." << std::endl;
@@ -112,7 +165,11 @@ void PipelineLoadLog::completion() {
                               .count();
     std::cerr << "[" << m_tag << " model '" << m_id << "'] loaded in "
               << load_s << " s" << std::endl;
-    log_model_memory(m_tag, m_id, m_device);
+    std::vector<std::string> devices{m_device};
+    if (!m_second_device.empty() && m_second_device != m_device) {
+        devices.push_back(m_second_device);
+    }
+    log_model_memory(m_tag, m_id, devices);
 }
 
 }  // namespace ovserver

@@ -190,6 +190,9 @@ struct TextGenerationSpec {
     bool enable_mtp = true;
     // Directory for OpenVINO compiled-model blobs. Empty disables caching.
     std::string cache_dir;
+    // Device for the speculative-decoding draft model (bundled MTP head).
+    // Empty reuses `device`.
+    std::string second_device;
 };
 
 }  // namespace ovserver

@@ -425,7 +425,13 @@ const char* ascii_lower(std::string& s) {
 TextGenerationModel::TextGenerationModel(const std::string& id,
     const TextGenerationSpec& spec)
     : m_id(id), m_models_path(spec.path), m_device(spec.device) {
-    PipelineLoadLog load_log("text", id, m_models_path, m_device);
+    const bool mtp_active = !spec.prompt_lookup && spec.enable_mtp &&
+        std::filesystem::exists(spec.path / "openvino_mtp_model.xml");
+    const std::string draft_device =
+        spec.second_device.empty() ? spec.device : spec.second_device;
+    PipelineLoadLog load_log(
+        "text", id, m_models_path, m_device,
+        mtp_active ? draft_device : std::string());
 
     ov::genai::SchedulerConfig sched_cfg;
     sched_cfg.cache_interval_multiplier = spec.cache_interval_multiplier;
@@ -443,16 +449,15 @@ TextGenerationModel::TextGenerationModel(const std::string& id,
         // properties. Both are exclusive: prompt_lookup wins when enabled.
         if (spec.prompt_lookup) {
             props.insert(ov::genai::prompt_lookup(true));
-        } else if (spec.enable_mtp &&
-                   std::filesystem::exists(spec.path / "openvino_mtp_model.xml")) {
-            props.insert(ov::genai::draft_model(spec.path, spec.device));
+        } else if (mtp_active) {
+            props.insert(ov::genai::draft_model(spec.path, draft_device));
             std::cerr << "[text model '" << id
-                      << "'] MTP speculative decoding enabled (bundled head)"
+                      << "'] MTP speculative decoding enabled (bundled head, "
+                      << "draft on " << draft_device << ")"
                       << std::endl;
         }
         m_prompt_lookup_active = spec.prompt_lookup;
-        m_mtp_active = !spec.prompt_lookup && spec.enable_mtp &&
-                       std::filesystem::exists(spec.path / "openvino_mtp_model.xml");
+        m_mtp_active = mtp_active;
         m_num_assistant_tokens = spec.num_assistant_tokens;
         m_max_ngram_size = spec.max_ngram_size;
         if (spec.prompt_lookup) {
