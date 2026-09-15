@@ -29,6 +29,7 @@ add_executable(openvino-server
     src/wav2txt.cc
     src/txt2wav.cc
     src/base64.cc
+    src/model_detect.cc
 )
 
 target_include_directories(openvino-server PRIVATE

@@ -16,6 +16,7 @@
 #include "ovserver/common.hpp"
 #include "ovserver/controller.hpp"
 #include "ovserver/manager.hpp"
+#include "ovserver/model_detect.hpp"
 #include "ovserver/txt2wav.hpp"
 
 namespace {
@@ -45,6 +46,9 @@ void usage(const char* argv0) {
         << "                          (speech recognition).\n"
         << "      --txt2wav           Serve the model on /v1/audio/speech\n"
         << "                          (text-to-speech).\n"
+        << "                          The mode is auto-detected from the model\n"
+        << "                          directory when none of the above is given;\n"
+        << "                          pass a flag explicitly to override.\n"
         << "      --device-props JSON  Device-scoped inference properties as\n"
         << "                          JSON, e.g. '{\"gpu\":{\"KV_CACHE_PRECISION\":\n"
         << "                          \"u8\"}}'. Top-level keys are device names\n"
@@ -230,10 +234,30 @@ int main(int argc, char** argv) {
     }
     if (!enable_txt2img && !enable_txt2txt && !enable_txt2vid &&
         !enable_wav2txt && !enable_txt2wav) {
-        std::cerr << "error: at least one of --txt2img, --txt2txt, --txt2vid, "
-                     "--wav2txt or --txt2wav is required\n";
-        usage(argv[0]);
-        return 2;
+        const std::vector<ovserver::ModelCapability> detected =
+            ovserver::detect_model_capabilities(model_path);
+        if (detected.empty()) {
+            std::cerr
+                << "error: no mode flag given and could not auto-detect the "
+                   "model type from '"
+                << model_path << "'\n";
+            std::cerr << "pass one of --txt2img, --txt2txt, --txt2vid, "
+                         "--wav2txt or --txt2wav\n";
+            usage(argv[0]);
+            return 2;
+        }
+        for (const ovserver::ModelCapability cap : detected) {
+            switch (cap) {
+                case ovserver::ModelCapability::Txt2Img: enable_txt2img = true; break;
+                case ovserver::ModelCapability::Txt2Txt: enable_txt2txt = true; break;
+                case ovserver::ModelCapability::Txt2Vid: enable_txt2vid = true; break;
+                case ovserver::ModelCapability::Wav2Txt: enable_wav2txt = true; break;
+                case ovserver::ModelCapability::Txt2Wav: enable_txt2wav = true; break;
+                case ovserver::ModelCapability::Unknown: break;
+            }
+            std::cerr << "[auto-detect] '" << model_path << "' identified as "
+                      << ovserver::capability_name(cap) << std::endl;
+        }
     }
 
     ovserver::set_ffmpeg_path(ffmpeg);
