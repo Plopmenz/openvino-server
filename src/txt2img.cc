@@ -25,8 +25,7 @@ ImageResult extract_image(const ov::Tensor& result, std::size_t index) {
     img.channels = static_cast<int>(shape[3]);
 
     const auto* data = result.data<uint8_t>();
-    const std::size_t plane =
-        static_cast<std::size_t>(img.height * img.width * img.channels);
+    const std::size_t plane = shape[1] * shape[2] * shape[3];
     const std::size_t offset = index * plane;
     img.data.assign(data + offset, data + offset + plane);
     return img;
@@ -37,14 +36,14 @@ ImageGenerationModel::ImageGenerationModel(
     const std::filesystem::path& models_path,
     const std::string& device,
     const std::string& cache_dir)
-    : m_id(id), m_models_path(models_path), m_device(device) {
+    : m_id(id) {
     // Build the pipeline on startup, exactly like the reference Python path
     // (Text2ImagePipeline(path, device)): no shape or plugin configuration.
     PipelineLoadLog load_log("image", id, models_path, device);
     try {
         m_pipeline = std::make_shared<ov::genai::Text2ImagePipeline>(
-            m_models_path, m_device,
-            inference_properties(m_device, cache_dir));
+            models_path, device,
+            inference_properties(device, cache_dir));
     } catch (const std::exception& e) {
         std::cerr << "[image model '" << id << "'] loading FAILED: " << e.what()
                   << std::endl;
@@ -87,18 +86,7 @@ std::vector<ImageResult> ImageGenerationModel::generate(
     const auto gen_start = std::chrono::steady_clock::now();
     // Log each denoising step's duration individually as it completes.
     properties[ov::genai::callback.name()] =
-        std::function<bool(size_t, size_t, ov::Tensor&)>(
-            [this, req_id, last = gen_start](size_t step, size_t total,
-                                             ov::Tensor&) mutable -> bool {
-                const auto now = std::chrono::steady_clock::now();
-                const auto step_s =
-                    std::chrono::duration<double>(now - last).count();
-                last = now;
-                std::cerr << "[image model '" << m_id << "'] request " << req_id
-                          << " step " << step + 1 << "/" << total << ": "
-                          << step_s << " s" << std::endl;
-                return false;
-            });
+        step_logger("image", m_id, req_id, gen_start);
 
     ov::Tensor result;
     double gen_s = 0.0;

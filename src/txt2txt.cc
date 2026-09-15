@@ -30,6 +30,8 @@ std::string finish_reason_str(ov::genai::GenerationFinishReason r) {
         case ov::genai::GenerationFinishReason::TOOL_CALL:
             return "tool_calls";
         case ov::genai::GenerationFinishReason::STOP:
+            return "stop";
+        case ov::genai::GenerationFinishReason::NONE:
         default:
             return "stop";
     }
@@ -210,11 +212,12 @@ std::string json_quote(const std::string& s) {
 std::string trim_ws(const std::string& s) {
     std::size_t b = 0, e = s.size();
     while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\n' ||
-                     s[b] == '\r')) {
+                     s[b] == '\r' || s[b] == '\f' || s[b] == '\v')) {
         ++b;
     }
     while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' ||
-                     s[e - 1] == '\n' || s[e - 1] == '\r')) {
+                     s[e - 1] == '\n' || s[e - 1] == '\r' ||
+                     s[e - 1] == '\f' || s[e - 1] == '\v')) {
         --e;
     }
     return s.substr(b, e - b);
@@ -287,6 +290,38 @@ std::optional<ToolCall> parse_xml_tool_call(const std::string& text,
     return call;
 }
 
+// Parses a JSON tool call from an object text string (already located via
+// scan_json_object). Returns nullopt when the object is not a valid "name" +
+// "arguments" tool call.
+std::optional<ToolCall> parse_json_tool_call(const std::string& obj_text,
+                                             std::size_t& idx) {
+    try {
+        ov::genai::JsonContainer parsed =
+            ov::genai::JsonContainer::from_json_string(obj_text);
+        if (parsed.is_object() && parsed.contains("name") &&
+            parsed["name"].is_string() && parsed["name"].as_string() &&
+            !parsed["name"].as_string()->empty()) {
+            std::string args_str = "{}";
+            if (parsed.contains("arguments")) {
+                const ov::genai::JsonContainer args = parsed["arguments"];
+                if (args.is_string() && args.as_string()) {
+                    args_str = *args.as_string();
+                } else {
+                    args_str = args.to_json_string();
+                }
+            }
+            ToolCall call;
+            call.id = "call_" + std::to_string(idx++);
+            call.name = *parsed["name"].as_string();
+            call.arguments = std::move(args_str);
+            return call;
+        }
+    } catch (const std::exception&) {
+        // Not a valid JSON object; keep scanning for the next one.
+    }
+    return std::nullopt;
+}
+
 // Extracts OpenAI-format tool calls from assistant output.
 //
 // Handles two formats, both optional wrapping in <tool_call>...</tool_call>:
@@ -334,31 +369,8 @@ std::vector<ToolCall> extract_tool_calls(const std::string& text) {
             }
             const auto obj = scan_json_object(text, start);
             if (obj && start + obj->size() <= stop) {
-                try {
-                    ov::genai::JsonContainer parsed =
-                        ov::genai::JsonContainer::from_json_string(*obj);
-                    if (parsed.is_object() && parsed.contains("name") &&
-                        parsed["name"].is_string() &&
-                        parsed["name"].as_string() &&
-                        !parsed["name"].as_string()->empty()) {
-                        std::string args_str = "{}";
-                        if (parsed.contains("arguments")) {
-                            const ov::genai::JsonContainer args =
-                                parsed["arguments"];
-                            if (args.is_string() && args.as_string()) {
-                                args_str = *args.as_string();
-                            } else {
-                                args_str = args.to_json_string();
-                            }
-                        }
-                        ToolCall call;
-                        call.id = "call_" + std::to_string(idx++);
-                        call.name = *parsed["name"].as_string();
-                        call.arguments = std::move(args_str);
-                        calls.push_back(std::move(call));
-                    }
-                } catch (const std::exception&) {
-                    // Not a valid JSON object; keep scanning for the next one.
+                if (auto call = parse_json_tool_call(*obj, idx)) {
+                    calls.push_back(std::move(*call));
                 }
                 pos = start + obj->size();
             } else {
@@ -381,43 +393,21 @@ std::vector<ToolCall> extract_tool_calls(const std::string& text) {
         if (!obj) {
             break;
         }
-        try {
-            ov::genai::JsonContainer parsed =
-                ov::genai::JsonContainer::from_json_string(*obj);
-            if (parsed.is_object() && parsed.contains("name") &&
-                parsed["name"].is_string() &&
-                parsed["name"].as_string() &&
-                !parsed["name"].as_string()->empty()) {
-                std::string args_str = "{}";
-                if (parsed.contains("arguments")) {
-                    const ov::genai::JsonContainer args = parsed["arguments"];
-                    if (args.is_string() && args.as_string()) {
-                        args_str = *args.as_string();
-                    } else {
-                        args_str = args.to_json_string();
-                    }
-                }
-                ToolCall call;
-                call.id = "call_" + std::to_string(idx++);
-                call.name = *parsed["name"].as_string();
-                call.arguments = std::move(args_str);
-                calls.push_back(std::move(call));
-            }
-        } catch (const std::exception&) {
-            // Not a valid JSON object; keep scanning for the next one.
+        if (auto call = parse_json_tool_call(*obj, idx)) {
+            calls.push_back(std::move(*call));
         }
         pos = start + obj->size();
     }
     return calls;
 }
 
-const char* ascii_lower(std::string& s) {
+std::string& ascii_lower(std::string& s) {
     for (char& c : s) {
         if (c >= 'A' && c <= 'Z') {
             c = static_cast<char>(c - 'A' + 'a');
         }
     }
-    return s.c_str();
+    return s;
 }
 
 }  // namespace
@@ -437,11 +427,7 @@ TextGenerationModel::TextGenerationModel(const std::string& id,
     sched_cfg.cache_interval_multiplier = spec.cache_interval_multiplier;
     sched_cfg.enable_prefix_caching = spec.enable_prefix_caching;
     try {
-        GpuTuning gpu;
-        gpu.kv_cache_precision = ov::element::Type(spec.kv_cache_precision);
-        gpu.dynamic_quantization_group_size = spec.dynamic_quant_group_size;
-        gpu.enable_sdpa_optimization = spec.enable_sdpa_optimization;
-        ov::AnyMap props = inference_properties(m_device, spec.cache_dir, gpu);
+        ov::AnyMap props = inference_properties(m_device, spec.cache_dir);
         // Speculative decoding: prompt-lookup drafts candidates by n-gram
         // matching against the prompt (no extra model); otherwise if the model
         // ships a bundled MTP head (openvino_mtp_model.xml) it is used for
@@ -537,21 +523,17 @@ void TextGenerationModel::detect_parsers() {
     const std::string family = ascii_lower(config_lower);
     const std::string tmpl_lower = [&] {
         std::string t = tmpl;
-        return std::string(ascii_lower(t));
+        return ascii_lower(t);
     }();
 
-    // --- Reasoning markers -----------------------------------------------
-    if (tmpl_lower.find("</think>") != std::string::npos) {
-        // Qwen3.5 / Qwen3.6: reasoning block ends with </think>.
-        m_reasoning = ReasoningMarkers{/*enabled=*/true,
-                                       /*expect_open_tag=*/false,
-                                       /*open_tag=*/"",
-                                       /*close_tag=*/"</think>"};
-    } else if (family.find("deepseek") != std::string::npos ||
-               tmpl_lower.find("reasoning_content") != std::string::npos ||
-               tmpl_lower.find(" reasoning") != std::string::npos) {
-        // DeepSeek-R1 (and distills): the open tag is injected by the template
-        // (or history), generation starts inside the reasoning section.
+// --- Reasoning markers -----------------------------------------------
+    if (tmpl_lower.find(" response") != std::string::npos ||
+        family.find("deepseek") != std::string::npos ||
+        tmpl_lower.find("reasoning_content") != std::string::npos ||
+        tmpl_lower.find(" reasoning") != std::string::npos) {
+        // Qwen3.5 / Qwen3.6 / DeepSeek-R1 (and distills): the reasoning block
+        // closes with " response", and the open tag is injected by the template
+        // (or history), so generation starts inside the reasoning section.
         m_reasoning = ReasoningMarkers{/*enabled=*/true,
                                        /*expect_open_tag=*/false,
                                        /*open_tag=*/"",
@@ -565,10 +547,11 @@ void TextGenerationModel::detect_parsers() {
                                        /*close_tag=*/" response"};
     }
 
-    // --- Tool calling -----------------------------------------------------
-    m_tools_supported = tmpl.find("<tool_call>") != std::string::npos ||
-                        tmpl.find("<tool_response>") != std::string::npos ||
-                        tmpl.find("tools") != std::string::npos;
+    // --- Tool calling -------------------------------------------------------
+    const bool tools_supported =
+        tmpl.find("<tool_call>") != std::string::npos ||
+        tmpl.find("<tool_response>") != std::string::npos ||
+        tmpl.find("tools") != std::string::npos;
 
     std::cerr << "[text model '" << m_id << "'] parsers: reasoning=";
     if (m_reasoning.enabled) {
@@ -582,7 +565,7 @@ void TextGenerationModel::detect_parsers() {
     } else {
         std::cerr << "none (raw output)";
     }
-    std::cerr << " | tools=" << (m_tools_supported ? "yes" : "no")
+    std::cerr << " | tools=" << (tools_supported ? "yes" : "no")
               << std::endl;
 }
 
@@ -633,14 +616,12 @@ void TextGenerationModel::snapshot_log(
                 // baseline now so its rates show up from the next snapshot.
                 m.has_baseline = true;
                 m.baseline_tokens = m.tokens;
-                m.baseline_time = now;
                 continue;
             }
             if (m.tokens > m.baseline_tokens) {
                 decode_delta += m.tokens - m.baseline_tokens;
             }
             m.baseline_tokens = m.tokens;
-            m.baseline_time = now;
         }
 
         const double dt =
@@ -734,9 +715,7 @@ TextResult TextGenerationModel::generate(const TextGenerateOptions& opts) {
     }
     {
         std::lock_guard<std::mutex> lock(m_metrics_mutex);
-        m_requests[req_id] = {std::chrono::steady_clock::now(),
-                              std::chrono::steady_clock::now(), 0, 0,
-                              prompt_tokens, false};
+        m_requests[req_id] = {0, 0, prompt_tokens, false};
     }
 
     std::string accumulated;
@@ -751,35 +730,33 @@ TextResult TextGenerationModel::generate(const TextGenerateOptions& opts) {
     // plain output would otherwise be misrouted to reasoning_content.
     //
     // `split_reasoning` gates the splitter entirely.  When true the single
-    // splitter instance handles both streaming and non-streaming: words are
-    // always accumulated via callbacks; only when the request provides an
-    // on_reasoning callback do we also deliver fragments incrementally.
+    // splitter instance handles both streaming and non-streaming. Fragments
+    // are always accumulated for the final result; when the request provides
+    // the matching callback we also deliver them incrementally.
     const bool split_reasoning =
         m_reasoning.enabled &&
         !chat_template_disables_thinking(opts.chat_template_kwargs);
-    const bool deliver_incrementally = split_reasoning && opts.on_reasoning != nullptr;
     ReasoningStreamSplitter splitter(m_reasoning.expect_open_tag,
                                      m_reasoning.open_tag,
                                      m_reasoning.close_tag);
+    auto on_visible_text = [&accumulated, &opts](std::string w) -> bool {
+        accumulated += w;
+        if (opts.on_text) {
+            return opts.on_text(std::move(w));
+        }
+        return true;
+    };
+    auto on_reasoning_text = [&reasoning_accumulated,
+                              &opts](std::string w) -> bool {
+        reasoning_accumulated += w;
+        if (opts.on_reasoning) {
+            return opts.on_reasoning(std::move(w));
+        }
+        return true;
+    };
     auto on_word = [&](std::string word) -> ov::genai::CallbackTypeVariant {
         if (split_reasoning) {
-            const bool ok = splitter.feed(
-                word,
-                [&accumulated, &opts, deliver_incrementally](std::string w) {
-                    accumulated += w;
-                    if (deliver_incrementally && opts.on_text) {
-                        return opts.on_text(std::move(w));
-                    }
-                    return true;
-                },
-                [&reasoning_accumulated, &opts, deliver_incrementally](std::string w) {
-                    reasoning_accumulated += w;
-                    if (deliver_incrementally && opts.on_reasoning) {
-                        return opts.on_reasoning(std::move(w));
-                    }
-                    return true;
-                });
-            if (!ok) {
+            if (!splitter.feed(word, on_visible_text, on_reasoning_text)) {
                 return ov::genai::StreamingStatus::CANCEL;
             }
             return ov::genai::StreamingStatus::RUNNING;
@@ -849,21 +826,7 @@ TextResult TextGenerationModel::generate(const TextGenerateOptions& opts) {
         // Flush any tail text held back for a possibly-marker-prefix.
         // The callbacks accumulate into accumulated/reasoning_accumulated
         // (non-streaming) and also deliver incrementally when streaming.
-        splitter.flush(
-            [&accumulated, &opts, deliver_incrementally](std::string w) {
-                accumulated += w;
-                if (deliver_incrementally && opts.on_text) {
-                    return opts.on_text(std::move(w));
-                }
-                return true;
-            },
-            [&reasoning_accumulated, &opts, deliver_incrementally](std::string w) {
-                reasoning_accumulated += w;
-                if (deliver_incrementally && opts.on_reasoning) {
-                    return opts.on_reasoning(std::move(w));
-                }
-                return true;
-            });
+        splitter.flush(on_visible_text, on_reasoning_text);
     }
 
     const auto gen_end = std::chrono::steady_clock::now();

@@ -60,8 +60,6 @@ public:
 
 private:
     std::string m_id;
-    std::filesystem::path m_models_path;
-    std::string m_device;
 
     std::mutex m_mutex;
     std::shared_ptr<ov::genai::Text2ImagePipeline> m_pipeline;

@@ -45,14 +45,12 @@ void usage(const char* argv0) {
         << "                          (speech recognition).\n"
         << "      --txt2wav           Serve the model on /v1/audio/speech\n"
         << "                          (text-to-speech).\n"
-        << "      --kv-cache-precision TYPE\n"
-        << "                          KV cache element type for text models on GPU.\n"
-        << "                          Default: u8.\n"
-        << "      --dynamic-quant-gsize N\n"
-        << "                          Dynamic quantization group size for GPU text\n"
-        << "                          inference. Default: 32.\n"
-        << "      --enable-sdpa BOOL   Enable SDPA optimization for GPU text\n"
-        << "                          inference. Default: true.\n"
+        << "      --device-props JSON  Device-scoped inference properties as\n"
+        << "                          JSON, e.g. '{\"gpu\":{\"KV_CACHE_PRECISION\":\n"
+        << "                          \"u8\"}}'. Top-level keys are device names\n"
+        << "                          (case-insensitive) whose values are\n"
+        << "                          OpenVINO property maps forwarded verbatim\n"
+        << "                          to the GenAI pipeline.\n"
         << "      --cache-interval-multiplier N\n"
         << "                          Linear-attention KV checkpoint interval, in\n"
         << "                          KV blocks. Ignored by models without linear\n"
@@ -133,9 +131,7 @@ int main(int argc, char** argv) {
     std::string log_level = "INFO";
     std::string config_file;
     size_t idle_timeout = 3600;
-    std::string kv_cache_precision = "u8";
-    size_t dynamic_quant_group_size = 32;
-    bool enable_sdpa = true;
+    std::string device_props;
     size_t cache_interval_multiplier = 64;
     bool enable_prefix_caching = true;
     bool prompt_lookup = false;
@@ -194,21 +190,8 @@ int main(int argc, char** argv) {
                 config_file = get_arg(argc, argv, i, a.c_str());
             } else if (a == "--idle-timeout") {
                 idle_timeout = std::stoul(get_arg(argc, argv, i, a.c_str()));
-            } else if (a == "--kv-cache-precision") {
-                kv_cache_precision = get_arg(argc, argv, i, a.c_str());
-            } else if (a == "--dynamic-quant-gsize") {
-                dynamic_quant_group_size =
-                    std::stoul(get_arg(argc, argv, i, a.c_str()));
-            } else if (a == "--enable-sdpa") {
-                const std::string v = get_arg(argc, argv, i, a.c_str());
-                if (v == "1" || v == "true" || v == "TRUE") {
-                    enable_sdpa = true;
-                } else if (v == "0" || v == "false" || v == "FALSE") {
-                    enable_sdpa = false;
-                } else {
-                    throw std::runtime_error(
-                        "--enable-sdpa expects true or false");
-                }
+            } else if (a == "--device-props") {
+                device_props = get_arg(argc, argv, i, a.c_str());
             } else if (a == "--cache-interval-multiplier") {
                 cache_interval_multiplier =
                     std::stoul(get_arg(argc, argv, i, a.c_str()));
@@ -254,6 +237,13 @@ int main(int argc, char** argv) {
     }
 
     ovserver::set_ffmpeg_path(ffmpeg);
+    try {
+        ovserver::set_device_props(device_props);
+    } catch (const std::exception& e) {
+        std::cerr << "error: " << e.what() << "\n";
+        usage(argv[0]);
+        return 2;
+    }
 
     if (!cache_dir.empty()) {
         try {
@@ -326,9 +316,6 @@ int main(int argc, char** argv) {
             ovserver::ModelManager::instance().load_text(
                 id, {p,
                      device,
-                     kv_cache_precision,
-                     dynamic_quant_group_size,
-                     enable_sdpa,
                      cache_interval_multiplier,
                      enable_prefix_caching,
                      prompt_lookup,

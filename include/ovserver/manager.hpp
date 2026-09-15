@@ -21,49 +21,41 @@ public:
     static ModelManager& instance();
 
     void load_image(const std::string& id, const ImageGenerationSpec& spec);
-    ImageGenerationModel* get_image(const std::string& id) const;
+    std::shared_ptr<ImageGenerationModel> get_image(const std::string& id) const;
 
     void load_text(const std::string& id, const TextGenerationSpec& spec);
-    TextGenerationModel* get_text(const std::string& id) const;
+    std::shared_ptr<TextGenerationModel> get_text(const std::string& id) const;
 
     void load_video(const std::string& id, const VideoGenerationSpec& spec);
-    VideoGenerationModel* get_video(const std::string& id) const;
+    std::shared_ptr<VideoGenerationModel> get_video(const std::string& id) const;
 
     void load_asr(const std::string& id, const ASRSpec& spec);
-    ASRModel* get_asr(const std::string& id) const;
+    std::shared_ptr<ASRModel> get_asr(const std::string& id) const;
 
     void load_tts(const std::string& id, const TTSSpec& spec);
-    TTSModel* get_tts(const std::string& id) const;
+    std::shared_ptr<TTSModel> get_tts(const std::string& id) const;
 
     // Releases all loaded models. Called explicitly on shutdown so genai/OV
     // objects are destroyed while the process and OpenVINO plugins are still
     // fully initialized (teardown during C++ static destruction segfaults).
+    // Callers holding a shared_ptr from the get_*() accessors keep their model
+    // alive across this call.
     void shutdown();
 
-    const std::unordered_map<std::string, std::shared_ptr<ImageGenerationModel>>&
-    all_images() const {
-        return m_image_models;
-    }
+    // Snapshots of the loaded models, taken under the registry lock so the
+    // caller can iterate without racing concurrent load()/shutdown() calls.
+    std::unordered_map<std::string, std::shared_ptr<ImageGenerationModel>>
+    all_images() const;
 
-    const std::unordered_map<std::string, std::shared_ptr<TextGenerationModel>>&
-    all_text() const {
-        return m_text_models;
-    }
+    std::unordered_map<std::string, std::shared_ptr<TextGenerationModel>>
+    all_text() const;
 
-    const std::unordered_map<std::string, std::shared_ptr<VideoGenerationModel>>&
-    all_video() const {
-        return m_video_models;
-    }
+    std::unordered_map<std::string, std::shared_ptr<VideoGenerationModel>>
+    all_video() const;
 
-    const std::unordered_map<std::string, std::shared_ptr<ASRModel>>& all_asr()
-        const {
-        return m_asr_models;
-    }
+    std::unordered_map<std::string, std::shared_ptr<ASRModel>> all_asr() const;
 
-    const std::unordered_map<std::string, std::shared_ptr<TTSModel>>& all_tts()
-        const {
-        return m_tts_models;
-    }
+    std::unordered_map<std::string, std::shared_ptr<TTSModel>> all_tts() const;
 
 private:
     mutable std::mutex m_mutex;

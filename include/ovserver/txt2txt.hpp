@@ -118,11 +118,6 @@ public:
 
     const std::string& id() const { return m_id; }
 
-    // Detected reasoning markers; empty open_tag means "no reasoning split".
-    const ReasoningMarkers& reasoning_markers() const { return m_reasoning; }
-    // True when the model's chat template supports <tool_call> function-calling.
-    bool tools_supported() const { return m_tools_supported; }
-
     TextResult generate(const TextGenerateOptions& opts);
 
 private:
@@ -135,8 +130,6 @@ private:
     // Per-request inference metrics. Worker threads accumulate `tokens`; the
     // executor thread samples them once per second to compute aggregate rates.
     struct RequestMetrics {
-        std::chrono::steady_clock::time_point start;
-        std::chrono::steady_clock::time_point baseline_time;
         std::size_t tokens = 0;           // generated tokens so far
         std::size_t baseline_tokens = 0;  // generated tokens at last snapshot
         std::size_t prompt_tokens = 0;    // encoded prompt length
@@ -150,7 +143,6 @@ private:
     std::shared_ptr<ov::genai::ContinuousBatchingPipeline> m_pipeline;
     ov::genai::Tokenizer m_tokenizer;
     ReasoningMarkers m_reasoning;
-    bool m_tools_supported = false;
     // Defaults seeded from the model's generation_config.json (if present), the
     // same way OVMS builds its base GenerationConfig. Per-request overrides are
     // applied on top inside generate().
@@ -181,10 +173,6 @@ private:
 struct TextGenerationSpec {
     std::filesystem::path path;
     std::string device;
-    // GPU compile-time knobs (OVMS defaults). Applied only on GPU devices.
-    std::string kv_cache_precision = "u8";
-    std::uint64_t dynamic_quant_group_size = 32;
-    bool enable_sdpa_optimization = true;
     // Scheduler knob for linear-attention prefix caching (ignored by models
     // without linear attention layers).
     std::size_t cache_interval_multiplier = 64;

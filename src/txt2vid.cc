@@ -13,7 +13,6 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
-#include <sstream>
 
 #include <openvino/genai/image_generation/generation_config.hpp>
 #include <openvino/genai/video_generation/generation_config.hpp>
@@ -24,19 +23,29 @@
 namespace ovserver {
 namespace {
 
-std::string shell_quote(const std::string& value) {
-    std::string out;
-    out.reserve(value.size() + 2);
-    out.push_back('"');
-    for (char c : value) {
-        if (c == '"' || c == '\\' || c == '$' || c == '`') {
-            out.push_back('\\');
+// Closes a popen()'d FILE* on destruction unless release()d or close()d first.
+class PipeWrapper {
+public:
+    explicit PipeWrapper(FILE* pipe) : m_pipe(pipe) {}
+    ~PipeWrapper() {
+        if (m_pipe != nullptr) {
+            pclose(m_pipe);
         }
-        out.push_back(c);
     }
-    out.push_back('"');
-    return out;
-}
+    PipeWrapper(const PipeWrapper&) = delete;
+    PipeWrapper& operator=(const PipeWrapper&) = delete;
+    int close() {
+        if (m_pipe == nullptr) {
+            return 0;
+        }
+        FILE* pipe = m_pipe;
+        m_pipe = nullptr;
+        return pclose(pipe);
+    }
+
+private:
+    FILE* m_pipe;
+};
 
 // Concatenates RGB frames into an MP4 (H.264) file at the given path using a
 // pipefed ffmpeg. Returns the output file size in bytes (0 means the encoder
@@ -66,15 +75,15 @@ std::uint64_t encode_frames_to_mp4(const std::string& out_path,
                   << std::endl;
         return 0;
     }
+    PipeWrapper pipe_guard(pipe);
     for (const auto& f : frames) {
         const std::size_t plane_size = f.rgb.size();
         const std::size_t written = fwrite(f.rgb.data(), 1, plane_size, pipe);
         if (written != plane_size) {
-            pclose(pipe);
             return 0;
         }
     }
-    const int status = pclose(pipe);
+    const int status = pipe_guard.close();
     if (status != 0) {
         std::cerr << "video encode: ffmpeg failed with status " << status
                   << " for " << out_path << std::endl;
@@ -198,13 +207,13 @@ VideoGenerationModel::VideoGenerationModel(
     const std::filesystem::path& models_path,
     const std::string& device,
     const std::string& cache_dir)
-    : m_id(id), m_models_path(models_path), m_device(device) {
-    PipelineLoadLog load_log("video", id, m_models_path, m_device);
+    : m_id(id) {
+    PipelineLoadLog load_log("video", id, models_path, device);
     try {
         m_pipeline =
             std::make_shared<ov::genai::Text2VideoPipeline>(
-                m_models_path.string(), m_device,
-                inference_properties(m_device, cache_dir));
+                models_path.string(), device,
+                inference_properties(device, cache_dir));
     } catch (const std::exception& e) {
         std::cerr << "[video model '" << id << "'] loading FAILED: " << e.what()
                   << std::endl;
@@ -255,18 +264,7 @@ std::vector<VideoResult> VideoGenerationModel::generate(
 
     // Log each denoising step's duration individually as it completes.
     properties[ov::genai::callback.name()] =
-        std::function<bool(size_t, size_t, ov::Tensor&)>(
-            [this, req_id, last = start](size_t step, size_t total,
-                                         ov::Tensor&) mutable -> bool {
-                const auto now = std::chrono::steady_clock::now();
-                const auto step_s =
-                    std::chrono::duration<double>(now - last).count();
-                last = now;
-                std::cerr << "[video model '" << m_id << "'] request " << req_id
-                          << " step " << step + 1 << "/" << total << ": "
-                          << step_s << " s" << std::endl;
-                return false;
-            });
+        step_logger("video", m_id, req_id, start);
 
     const ov::genai::VideoGenerationResult result = [&]() {
         std::lock_guard<std::mutex> lock(m_mutex);

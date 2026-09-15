@@ -10,19 +10,18 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <random>
 
-#include <sstream>
-
 #include <iostream>
+
+#include "ovserver/common.hpp"
 
 namespace ovserver {
 namespace {
 
-std::string& g_ffmpeg_path() {
-    static std::string path = "ffmpeg";
-    return path;
-}
+std::mutex g_ffmpeg_path_mutex;
+std::string g_ffmpeg_path = "ffmpeg";
 
 // Writes `data` to a fresh temp file under the system temp dir and returns
 // its path. The caller is responsible for removal.
@@ -45,18 +44,21 @@ std::filesystem::path write_temp_file(const std::string& data,
     return path;
 }
 
-std::string shell_quote(const std::string& value) {
-    std::string out;
-    out.reserve(value.size() + 2);
-    out.push_back('"');
-    for (char c : value) {
-        if (c == '"' || c == '\\' || c == '$' || c == '`')
-            out.push_back('\\');
-        out.push_back(c);
+// Removes a temp file on destruction (or immediately on release).
+class TempFileCleanup {
+public:
+    explicit TempFileCleanup(std::filesystem::path path)
+        : m_path(std::move(path)) {}
+    ~TempFileCleanup() {
+        if (!m_path.empty())
+            std::filesystem::remove(m_path);
     }
-    out.push_back('"');
-    return out;
-}
+    TempFileCleanup(const TempFileCleanup&) = delete;
+    TempFileCleanup& operator=(const TempFileCleanup&) = delete;
+
+private:
+    std::filesystem::path m_path;
+};
 
 }  // namespace
 
@@ -103,44 +105,40 @@ std::vector<std::uint8_t> wav_pcm16(const std::vector<std::int16_t>& samples,
 }
 
 void set_ffmpeg_path(const std::string& path) {
-    g_ffmpeg_path() = path;
+    std::lock_guard<std::mutex> lock(g_ffmpeg_path_mutex);
+    g_ffmpeg_path = path;
 }
 
-const std::string& ffmpeg_path() {
-    return g_ffmpeg_path();
+std::string ffmpeg_path() {
+    std::lock_guard<std::mutex> lock(g_ffmpeg_path_mutex);
+    return g_ffmpeg_path;
 }
 
 std::vector<float> decode_audio_to_f32(const std::string& data, int sample_rate) {
     if (data.empty())
         return {};
     const std::filesystem::path in = write_temp_file(data, ".in.audio");
+    TempFileCleanup in_cleanup(in);
     const std::filesystem::path out = write_temp_file("", ".f32");
+    TempFileCleanup out_cleanup(out);
     std::vector<float> result;
-    try {
-        const std::string cmd =
-            shell_quote(ffmpeg_path()) +
-            " -hide_banner -loglevel error -y -i " +
-            shell_quote(in.string()) + " -ac 1 -ar " +
-            std::to_string(sample_rate) + " -f f32le " + shell_quote(out.string());
-        const int status = std::system(cmd.c_str());
-        if (status != 0)
-            throw std::runtime_error(
-                "audio decode: ffmpeg failed (is ffmpeg on PATH?)");
-        std::ifstream fin(out, std::ios::binary);
-        if (!fin)
-            throw std::runtime_error("audio decode: no decoded output");
-        std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(fin)),
-                                        std::istreambuf_iterator<char>());
-        const std::size_t n = bytes.size() / sizeof(float);
-        result.resize(n);
-        std::memcpy(result.data(), bytes.data(), n * sizeof(float));
-    } catch (...) {
-        std::filesystem::remove(in);
-        std::filesystem::remove(out);
-        throw;
-    }
-    std::filesystem::remove(in);
-    std::filesystem::remove(out);
+    const std::string cmd =
+        shell_quote(ffmpeg_path()) +
+        " -hide_banner -loglevel error -y -i " +
+        shell_quote(in.string()) + " -ac 1 -ar " +
+        std::to_string(sample_rate) + " -f f32le " + shell_quote(out.string());
+    const int status = std::system(cmd.c_str());
+    if (status != 0)
+        throw std::runtime_error(
+            "audio decode: ffmpeg failed (is ffmpeg on PATH?)");
+    std::ifstream fin(out, std::ios::binary);
+    if (!fin)
+        throw std::runtime_error("audio decode: no decoded output");
+    std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(fin)),
+                                    std::istreambuf_iterator<char>());
+    const std::size_t n = bytes.size() / sizeof(float);
+    result.resize(n);
+    std::memcpy(result.data(), bytes.data(), n * sizeof(float));
     return result;
 }
 

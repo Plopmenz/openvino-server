@@ -24,7 +24,8 @@ std::vector<float> decode_audio_to_f32(const std::string& data,
 // Path to the ffmpeg executable used for audio decoding and MP4 encoding.
 // Defaults to "ffmpeg" (resolved via PATH). Calling set_ffmpeg_path("")
 // disables ffmpeg-dependent features (they then raise std::runtime_error).
+// Thread-safe: ffmpeg_path() returns a snapshot.
 void set_ffmpeg_path(const std::string& path);
-const std::string& ffmpeg_path();
+std::string ffmpeg_path();
 
 }  // namespace ovserver

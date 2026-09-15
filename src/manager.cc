@@ -12,6 +12,54 @@ ModelManager& ModelManager::instance() {
     return mgr;
 }
 
+std::shared_ptr<ImageGenerationModel> ModelManager::get_image(
+    const std::string& id) const {
+    std::lock_guard lock(m_mutex);
+    auto it = m_image_models.find(id);
+    if (it == m_image_models.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+std::shared_ptr<TextGenerationModel> ModelManager::get_text(
+    const std::string& id) const {
+    std::lock_guard lock(m_mutex);
+    auto it = m_text_models.find(id);
+    if (it == m_text_models.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+std::shared_ptr<VideoGenerationModel> ModelManager::get_video(
+    const std::string& id) const {
+    std::lock_guard lock(m_mutex);
+    auto it = m_video_models.find(id);
+    if (it == m_video_models.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+std::shared_ptr<ASRModel> ModelManager::get_asr(const std::string& id) const {
+    std::lock_guard lock(m_mutex);
+    auto it = m_asr_models.find(id);
+    if (it == m_asr_models.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+std::shared_ptr<TTSModel> ModelManager::get_tts(const std::string& id) const {
+    std::lock_guard lock(m_mutex);
+    auto it = m_tts_models.find(id);
+    if (it == m_tts_models.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
 void ModelManager::load_image(const std::string& id,
                               const ImageGenerationSpec& spec) {
     std::lock_guard lock(m_mutex);
@@ -23,15 +71,6 @@ void ModelManager::load_image(const std::string& id,
     m_image_models.emplace(id, std::move(model));
 }
 
-ImageGenerationModel* ModelManager::get_image(const std::string& id) const {
-    std::lock_guard lock(m_mutex);
-    auto it = m_image_models.find(id);
-    if (it == m_image_models.end()) {
-        return nullptr;
-    }
-    return it->second.get();
-}
-
 void ModelManager::load_text(const std::string& id,
                              const TextGenerationSpec& spec) {
     std::lock_guard lock(m_mutex);
@@ -40,15 +79,6 @@ void ModelManager::load_text(const std::string& id,
     }
     auto model = std::make_shared<TextGenerationModel>(id, spec);
     m_text_models.emplace(id, std::move(model));
-}
-
-TextGenerationModel* ModelManager::get_text(const std::string& id) const {
-    std::lock_guard lock(m_mutex);
-    auto it = m_text_models.find(id);
-    if (it == m_text_models.end()) {
-        return nullptr;
-    }
-    return it->second.get();
 }
 
 void ModelManager::load_video(const std::string& id,
@@ -63,15 +93,6 @@ void ModelManager::load_video(const std::string& id,
     m_video_models.emplace(id, std::move(model));
 }
 
-VideoGenerationModel* ModelManager::get_video(const std::string& id) const {
-    std::lock_guard lock(m_mutex);
-    auto it = m_video_models.find(id);
-    if (it == m_video_models.end()) {
-        return nullptr;
-    }
-    return it->second.get();
-}
-
 void ModelManager::load_asr(const std::string& id, const ASRSpec& spec) {
     std::lock_guard lock(m_mutex);
     if (m_asr_models.find(id) != m_asr_models.end()) {
@@ -80,15 +101,6 @@ void ModelManager::load_asr(const std::string& id, const ASRSpec& spec) {
     auto model = std::make_shared<ASRModel>(id, spec.path, spec.device,
                                             spec.cache_dir);
     m_asr_models.emplace(id, std::move(model));
-}
-
-ASRModel* ModelManager::get_asr(const std::string& id) const {
-    std::lock_guard lock(m_mutex);
-    auto it = m_asr_models.find(id);
-    if (it == m_asr_models.end()) {
-        return nullptr;
-    }
-    return it->second.get();
 }
 
 void ModelManager::load_tts(const std::string& id, const TTSSpec& spec) {
@@ -101,13 +113,34 @@ void ModelManager::load_tts(const std::string& id, const TTSSpec& spec) {
     m_tts_models.emplace(id, std::move(model));
 }
 
-TTSModel* ModelManager::get_tts(const std::string& id) const {
+std::unordered_map<std::string, std::shared_ptr<ImageGenerationModel>>
+ModelManager::all_images() const {
     std::lock_guard lock(m_mutex);
-    auto it = m_tts_models.find(id);
-    if (it == m_tts_models.end()) {
-        return nullptr;
-    }
-    return it->second.get();
+    return m_image_models;
+}
+
+std::unordered_map<std::string, std::shared_ptr<TextGenerationModel>>
+ModelManager::all_text() const {
+    std::lock_guard lock(m_mutex);
+    return m_text_models;
+}
+
+std::unordered_map<std::string, std::shared_ptr<VideoGenerationModel>>
+ModelManager::all_video() const {
+    std::lock_guard lock(m_mutex);
+    return m_video_models;
+}
+
+std::unordered_map<std::string, std::shared_ptr<ASRModel>>
+ModelManager::all_asr() const {
+    std::lock_guard lock(m_mutex);
+    return m_asr_models;
+}
+
+std::unordered_map<std::string, std::shared_ptr<TTSModel>>
+ModelManager::all_tts() const {
+    std::lock_guard lock(m_mutex);
+    return m_tts_models;
 }
 
 void ModelManager::shutdown() {

@@ -4,12 +4,18 @@
 #include "ovserver/common.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <exception>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <memory>
+#include <string>
 #include <utility>
 #include <vector>
+
+#include <json/json.h>
 
 #include <openvino/runtime/core.hpp>
 #include <openvino/runtime/intel_gpu/properties.hpp>
@@ -18,6 +24,55 @@
 namespace ovserver {
 
 namespace {
+
+// Device-scoped property maps from set_device_props(). Keys are uppercased
+// device names as reported by OpenVINO (e.g. "GPU").
+using DevicePropsMap = std::map<std::string, ov::AnyMap>;
+
+DevicePropsMap& g_device_props() {
+    static DevicePropsMap props;
+    return props;
+}
+
+std::string upper_copy(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        out.push_back(static_cast<char>(
+            std::toupper(static_cast<unsigned char>(c))));
+    }
+    return out;
+}
+
+// Converts a JSON scalar to the closest native OpenVINO property value.
+ov::Any json_to_any(const Json::Value& v) {
+    if (v.isBool()) {
+        return v.asBool();
+    }
+    if (v.isUInt64() || v.isInt64()) {
+        return v.asInt64();
+    }
+    if (v.isDouble()) {
+        return v.asDouble();
+    }
+    if (v.isString()) {
+        return v.asString();
+    }
+    throw std::runtime_error("device property values must be a string, "
+                             "number or boolean");
+}
+
+ov::AnyMap json_to_props(const Json::Value& obj) {
+    if (!obj.isObject()) {
+        throw std::runtime_error(
+            "each device entry must be a JSON object of properties");
+    }
+    ov::AnyMap props;
+    for (const std::string& key : obj.getMemberNames()) {
+        props.emplace(key, json_to_any(obj[key]));
+    }
+    return props;
+}
 
 // Reads a sized field in kB from /proc/self/status (e.g. VmRSS).
 std::size_t proc_field_kb(const std::string& field) {
@@ -75,23 +130,82 @@ double device_npu_mib(const std::string& device) {
 
 }  // namespace
 
+void set_device_props(const std::string& json) {
+    if (json.empty()) {
+        g_device_props().clear();
+        return;
+    }
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    const std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    if (!reader->parse(json.data(), json.data() + json.size(), &root,
+                       &errors)) {
+        throw std::runtime_error("failed to parse --device-props JSON: " +
+                                 errors);
+    }
+    if (!root.isObject()) {
+        throw std::runtime_error("--device-props must be a JSON object "
+                                 "mapping device names to property maps");
+    }
+    DevicePropsMap& props = g_device_props();
+    props.clear();
+    for (const std::string& device : root.getMemberNames()) {
+        props.emplace(upper_copy(device), json_to_props(root[device]));
+    }
+}
+
 ov::AnyMap inference_properties(const std::string& device,
-                                const std::string& cache_dir,
-                                const GpuTuning& gpu) {
+                                const std::string& cache_dir) {
     ov::AnyMap properties;
     if (!cache_dir.empty()) {
         properties.emplace(ov::cache_dir(cache_dir));
     }
-    if (device.find("GPU") == std::string::npos) {
+    const DevicePropsMap& props = g_device_props();
+    if (props.empty()) {
         return properties;
     }
-    // Wrap GPU-specific hints in ov::device::properties so they are scoped to
-    // the GPU device.  GenAI forwards the full property map to the draft model
-    // compile call; without device-scoping the CPU plugin rejects unknown
-    // GPU-specific keys.
-    ov::AnyMap gpu_props;
-    properties.emplace(ov::device::properties("GPU", gpu_props));
+    auto it = props.find(upper_copy(device));
+    if (it == props.end()) {
+        return properties;
+    }
+    // Wrap device-scoped hints in ov::device::properties so they are forwarded
+    // to the OpenVINO plugin for this device only. GenAI forwards the full
+    // property map to the compile call; without device-scoping the CPU plugin
+    // would reject device-specific keys.
+    properties.emplace(ov::device::properties(device, it->second));
     return properties;
+}
+
+std::string shell_quote(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('"');
+    for (char c : value) {
+        if (c == '"' || c == '\\' || c == '$' || c == '`') {
+            out.push_back('\\');
+        }
+        out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+
+std::function<bool(std::size_t, std::size_t, ov::Tensor&)> step_logger(
+    const std::string& tag,
+    const std::string& id,
+    std::uint64_t req_id,
+    std::chrono::steady_clock::time_point start) {
+    return [tag, id, req_id, last = start](std::size_t step, std::size_t total,
+                                           ov::Tensor&) mutable -> bool {
+        const auto now = std::chrono::steady_clock::now();
+        const auto step_s = std::chrono::duration<double>(now - last).count();
+        last = now;
+        std::cerr << "[" << tag << " model '" << id << "'] request " << req_id
+                  << " step " << step + 1 << "/" << total << ": " << step_s
+                  << " s" << std::endl;
+        return false;
+    };
 }
 
 void log_model_memory(const std::string& tag,

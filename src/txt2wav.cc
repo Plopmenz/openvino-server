@@ -5,7 +5,6 @@
 
 #include <chrono>
 #include <iostream>
-#include <sstream>
 
 #include <openvino/genai/speech_generation/text2speech_pipeline.hpp>
 

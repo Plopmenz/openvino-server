@@ -64,14 +64,44 @@ bool getInt64(const Json::Value& obj, const char* key, int64_t& out) {
     return true;
 }
 
-// Converts a (sub)tree of the request JSON into the genai JsonContainer used by
-// ChatHistory / chat templates.
-ov::genai::JsonContainer json_to_genai(const Json::Value& v) {
+// Serializes JSON to a compact single-line string (no indentation/comments).
+std::string compact_json(const Json::Value& v) {
     Json::StreamWriterBuilder builder;
     builder["indentation"] = "";
     builder["commentStyle"] = "None";
-    return ov::genai::JsonContainer::from_json_string(
-        Json::writeString(builder, v));
+    return Json::writeString(builder, v);
+}
+
+// Returns the only entry of a model snapshot map, or nullptr when the map has
+// zero or more than one model (ambigous without an explicit 'model' field).
+template <typename Map>
+typename Map::mapped_type single_model(const Map& models) {
+    if (models.size() == 1) {
+        return models.begin()->second;
+    }
+    return nullptr;
+}
+
+// Parses a JSON request body into a Json::Value, throwing std::runtime_error
+// (mapped to HTTP 400) on malformed input.
+Json::Value parse_json_body(const drogon::HttpRequestPtr& req) {
+    Json::CharReaderBuilder reader;
+    reader["failIfExtra"] = false;
+    auto body_view = req->getBody();
+    std::istringstream stream(std::string(body_view.begin(), body_view.end()));
+    Json::Value body;
+    std::string errs;
+    if (!Json::parseFromStream(reader, stream, &body, &errs) ||
+        !body.isObject()) {
+        throw std::runtime_error("Invalid JSON request body: " + errs);
+    }
+    return body;
+}
+
+// Converts a (sub)tree of the request JSON into the genai JsonContainer used by
+// ChatHistory / chat templates.
+ov::genai::JsonContainer json_to_genai(const Json::Value& v) {
+    return ov::genai::JsonContainer::from_json_string(compact_json(v));
 }
 
 // OpenAI "response_format" -> structured output constraint.
@@ -105,10 +135,7 @@ std::optional<ov::genai::StructuredOutputConfig> parse_response_format(
                 "'response_format' of type \"json_schema\" requires a "
                 "\"json_schema.schema\" JSON object");
         }
-        Json::StreamWriterBuilder builder;
-        builder["indentation"] = "";
-        builder["commentStyle"] = "None";
-        schema = Json::writeString(builder, rf["json_schema"]["schema"]);
+        schema = compact_json(rf["json_schema"]["schema"]);
     } else {
         throw std::runtime_error(
             "'response_format.type' must be \"text\", \"json_object\" or "
@@ -121,10 +148,7 @@ std::optional<ov::genai::StructuredOutputConfig> parse_response_format(
 drogon::HttpResponsePtr json_response(const Json::Value& body,
                                       drogon::HttpStatusCode code =
                                           drogon::k200OK) {
-    Json::StreamWriterBuilder builder;
-    builder["commentStyle"] = "None";
-    builder["indentation"] = "";
-    std::string payload = Json::writeString(builder, body);
+    std::string payload = compact_json(body);
     auto resp = drogon::HttpResponse::newHttpResponse();
     resp->setStatusCode(code);
     resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
@@ -143,7 +167,7 @@ drogon::HttpResponsePtr error_response(std::string message,
 }
 
 drogon::HttpResponsePtr internal_error_response(const std::exception& e) {
-    return error_response("Failed to generate image: " + std::string(e.what()),
+    return error_response("Generation failed: " + std::string(e.what()),
                           drogon::k500InternalServerError);
 }
 
@@ -231,13 +255,38 @@ std::string sse_message(const std::string& json) {
     return out;
 }
 
+// Shared state of a streaming (SSE) response: the async stream handle,
+// resolved once the framework provides it, plus a mutex so generation
+// callbacks (genai threads) and the driving worker thread can send on it
+// safely. The stream lives here so callers keep a stable pointer across the
+// async handoff.
+struct StreamState {
+    std::shared_ptr<drogon::ResponseStream> stream;
+    std::mutex mutex;
+};
+
+// Sends one JSON payload as an SSE frame on a shared stream. Returns false if
+// the client is gone (in which case the stream is dropped).
+bool send_sse(std::shared_ptr<StreamState> state, const std::string& payload) {
+    std::lock_guard lock(state->mutex);
+    auto s = state->stream;
+    if (!s) {
+        return false;
+    }
+    const bool ok = s->send(sse_message(payload));
+    if (!ok) {
+        state->stream.reset();
+    }
+    return ok;
+}
+
 // One streaming chunk of an OpenAI chat.completion.chunk object.
 Json::Value chat_chunk(const std::string& id, const Json::Value& delta,
                        const std::string& finish_reason) {
     Json::Value chunk;
     chunk["id"] = id;
     chunk["object"] = "chat.completion.chunk";
-    chunk["created"] = static_cast<int>(std::time(nullptr));
+    chunk["created"] = static_cast<std::int64_t>(std::time(nullptr));
     chunk["model"] = Json::nullValue;  // filled in by caller
     Json::Value choice;
     choice["index"] = 0;
@@ -279,60 +328,46 @@ void registerHealth(drogon::HttpAppFramework& app) {
                         {drogon::Get});
 }
 
+// Appends one OpenAI model entry to a /v1/models response array.
+void append_model_entry(Json::Value& arr, const std::string& id) {
+    Json::Value m;
+    m["id"] = id;
+    m["object"] = "model";
+    m["created"] = 0;
+    m["owned_by"] = "openvino-genai";
+    arr.append(m);
+}
+
 void registerModels(drogon::HttpAppFramework& app) {
     app.registerHandler("/v1/models",
                         [](const drogon::HttpRequestPtr& req,
                            std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
                             (void)req;
                             Json::Value arr = Json::arrayValue;
-                            const auto& models = ModelManager::instance().all_images();
-                            for (const auto& entry : models) {
-                                Json::Value m;
-                                m["id"] = entry.first;
-                                m["object"] = "model";
-                                m["created"] = 0;
-                                m["owned_by"] = "openvino-genai";
-                                arr.append(m);
+                            for (const auto& [id, model] :
+                                 ModelManager::instance().all_images()) {
+                                (void)model;
+                                append_model_entry(arr, id);
                             }
-                            const auto& text_models =
-                                ModelManager::instance().all_text();
-                            for (const auto& entry : text_models) {
-                                Json::Value m;
-                                m["id"] = entry.first;
-                                m["object"] = "model";
-                                m["created"] = 0;
-                                m["owned_by"] = "openvino-genai";
-                                arr.append(m);
+                            for (const auto& [id, model] :
+                                 ModelManager::instance().all_text()) {
+                                (void)model;
+                                append_model_entry(arr, id);
                             }
-                            const auto& video_models =
-                                ModelManager::instance().all_video();
-                            for (const auto& entry : video_models) {
-                                Json::Value m;
-                                m["id"] = entry.first;
-                                m["object"] = "model";
-                                m["created"] = 0;
-                                m["owned_by"] = "openvino-genai";
-                                arr.append(m);
+                            for (const auto& [id, model] :
+                                 ModelManager::instance().all_video()) {
+                                (void)model;
+                                append_model_entry(arr, id);
                             }
-                            const auto& asr_models =
-                                ModelManager::instance().all_asr();
-                            for (const auto& entry : asr_models) {
-                                Json::Value m;
-                                m["id"] = entry.first;
-                                m["object"] = "model";
-                                m["created"] = 0;
-                                m["owned_by"] = "openvino-genai";
-                                arr.append(m);
+                            for (const auto& [id, model] :
+                                 ModelManager::instance().all_asr()) {
+                                (void)model;
+                                append_model_entry(arr, id);
                             }
-                            const auto& tts_models =
-                                ModelManager::instance().all_tts();
-                            for (const auto& entry : tts_models) {
-                                Json::Value m;
-                                m["id"] = entry.first;
-                                m["object"] = "model";
-                                m["created"] = 0;
-                                m["owned_by"] = "openvino-genai";
-                                arr.append(m);
+                            for (const auto& [id, model] :
+                                 ModelManager::instance().all_tts()) {
+                                (void)model;
+                                append_model_entry(arr, id);
                             }
                             Json::Value body;
                             body["object"] = "list";
@@ -347,28 +382,21 @@ void registerImageGenerations(drogon::HttpAppFramework& app) {
         "/v1/images/generations",
         [](const drogon::HttpRequestPtr& req,
            std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
-            Json::CharReaderBuilder reader;
-            reader["failIfExtra"] = false;
-            auto body_view = req->getBody();
-            std::istringstream stream(std::string(body_view.begin(), body_view.end()));
             Json::Value body;
-            std::string errs;
-            if (!Json::parseFromStream(reader, stream, &body, &errs) ||
-                !body.isObject()) {
-                callback(error_response("Invalid JSON request body: " + errs,
-                                        drogon::k400BadRequest));
+            try {
+                body = parse_json_body(req);
+            } catch (const std::exception& e) {
+                callback(error_response(e.what(), drogon::k400BadRequest));
                 return;
             }
 
             try {
                 const std::string prompt = getString(body, "prompt");
-                ImageGenerationModel* model = nullptr;
+                std::shared_ptr<ImageGenerationModel> model;
 
                 if (!body.isMember("model")) {
-                    auto& models = ModelManager::instance().all_images();
-                    if (models.size() == 1) {
-                        model = models.begin()->second.get();
-                    }
+                    model = single_model(
+                        ModelManager::instance().all_images());
                 } else if (body["model"].isString()) {
                     model = ModelManager::instance().get_image(body["model"].asString());
                 }
@@ -441,7 +469,6 @@ void registerImageGenerations(drogon::HttpAppFramework& app) {
                         body["response_format"].asString() == "url";
                     if (body.isMember("response_format") &&
                         body["response_format"].isString() &&
-                        !body["response_format"].isNull() &&
                         body["response_format"].asString() != "b64_json" &&
                         body["response_format"].asString() != "url") {
                         throw std::runtime_error(
@@ -500,7 +527,7 @@ void registerImageGenerations(drogon::HttpAppFramework& app) {
                                 data.append(item);
                             }
                             Json::Value out;
-                            out["created"] = static_cast<int>(std::time(nullptr));
+                            out["created"] = static_cast<std::int64_t>(std::time(nullptr));
                             out["data"] = data;
                             resp = json_response(out);
                         } catch (const std::exception& e) {
@@ -603,29 +630,22 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
         "/v1/chat/completions",
         [](const drogon::HttpRequestPtr& req,
            std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
-            Json::CharReaderBuilder reader;
-            reader["failIfExtra"] = false;
-            auto body_view = req->getBody();
-            std::istringstream stream(std::string(body_view.begin(), body_view.end()));
             Json::Value body;
-            std::string errs;
-            if (!Json::parseFromStream(reader, stream, &body, &errs) ||
-                !body.isObject()) {
-                callback(error_response("Invalid JSON request body: " + errs,
-                                        drogon::k400BadRequest));
+            try {
+                body = parse_json_body(req);
+            } catch (const std::exception& e) {
+                callback(error_response(e.what(), drogon::k400BadRequest));
                 return;
             }
 
             try {
-                TextGenerationModel* model = nullptr;
+                std::shared_ptr<TextGenerationModel> model;
                 if (body.isMember("model") && body["model"].isString()) {
                     model = ModelManager::instance().get_text(body["model"].asString());
                 }
                 if (!model) {
-                    auto& text_models = ModelManager::instance().all_text();
-                    if (text_models.size() == 1) {
-                        model = text_models.begin()->second.get();
-                    }
+                    model = single_model(
+                        ModelManager::instance().all_text());
                 }
                 if (!model) {
                     callback(error_response(
@@ -824,10 +844,6 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                     // stream is owned by a shared struct so both the genai
                     // streamer callback (genai thread) and the worker thread that
                     // drives generation can resolve and send on it safely.
-                    struct StreamState {
-                        std::shared_ptr<drogon::ResponseStream> stream;
-                        std::mutex mutex;
-                    };
                     auto state = std::make_shared<StreamState>();
                     std::shared_ptr<const std::string> shared_id =
                         std::make_shared<const std::string>(req_id);
@@ -846,24 +862,12 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                                 auto send_delta =
                                     [state, shared_id, shared_model](
                                         Json::Value delta) {
-                                        std::lock_guard lock(state->mutex);
-                                        auto s = state->stream;
-                                        if (!s) {
-                                            return false;
-                                        }
                                         Json::Value chunk = chat_chunk(
                                             *shared_id, delta, "");
                                         chunk["model"] = *shared_model;
-                                        Json::StreamWriterBuilder b;
-                                        b["indentation"] = "";
-                                        std::string payload =
-                                            Json::writeString(b, chunk);
-                                        const bool ok =
-                                            s->send(sse_message(payload));
-                                        if (!ok) {
-                                            state->stream.reset();
-                                        }
-                                        return ok;
+                                        return send_sse(
+                                            state,
+                                            compact_json(chunk));
                                     };
 
                                 TextGenerateOptions gen = opts;
@@ -931,8 +935,6 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                                     if (!state->stream) {
                                         return;
                                     }
-                                    Json::StreamWriterBuilder b;
-                                    b["indentation"] = "";
                                     Json::Value delta;
                                     if (!r.tool_calls.empty()) {
                                         // Function calls are only fully known
@@ -963,7 +965,7 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                                             : r.finish_reason);
                                     chunk["model"] = *shared_model;
                                     state->stream->send(sse_message(
-                                        Json::writeString(b, chunk)));
+                                        compact_json(chunk)));
                                     if (stream_usage) {
                                         Json::Value usage;
                                         usage["prompt_tokens"] =
@@ -979,13 +981,13 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                                         frame["id"] = *shared_id;
                                         frame["object"] =
                                             "chat.completion.chunk";
-                                        frame["created"] = static_cast<int>(
+                                        frame["created"] = static_cast<std::int64_t>(
                                             std::time(nullptr));
                                         frame["model"] = *shared_model;
                                         frame["choices"] = Json::arrayValue;
                                         frame["usage"] = usage;
                                         state->stream->send(sse_message(
-                                            Json::writeString(b, frame)));
+                                            compact_json(frame)));
                                     }
                                     state->stream->send(
                                         sse_message("[DONE]"));
@@ -1076,7 +1078,7 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                         Json::Value out;
                         out["id"] = req_id;
                         out["object"] = "chat.completion";
-                        out["created"] = static_cast<int>(std::time(nullptr));
+                        out["created"] = static_cast<std::int64_t>(std::time(nullptr));
                         out["model"] = model_name;
                         out["choices"] = choices;
                         usage["prompt_tokens"] = p_tokens;
@@ -1170,7 +1172,7 @@ std::filesystem::path g_video_storage_dir;
 // Request fields shared by the async job API and the synchronous generations
 // endpoint.
 struct ParsedVideoRequest {
-    VideoGenerationModel* model = nullptr;
+    std::shared_ptr<VideoGenerationModel> model;
     VideoGenerateOptions opts;
     std::size_t num_videos = 1;
     std::string size;
@@ -1185,10 +1187,7 @@ ParsedVideoRequest parse_video_request(const Json::Value& body) {
     p.opts.prompt = getString(body, "prompt");
 
     if (!body.isMember("model")) {
-        auto& models = ModelManager::instance().all_video();
-        if (models.size() == 1) {
-            p.model = models.begin()->second.get();
-        }
+        p.model = single_model(ModelManager::instance().all_video());
     } else if (body["model"].isString()) {
         p.model = ModelManager::instance().get_video(body["model"].asString());
     }
@@ -1301,22 +1300,6 @@ ParsedVideoRequest parse_video_request(const Json::Value& body) {
     return p;
 }
 
-// Parses a JSON request body into a Json::Value, throwing std::runtime_error
-// (mapped to HTTP 400) on malformed input.
-Json::Value parse_json_body(const drogon::HttpRequestPtr& req) {
-    Json::CharReaderBuilder reader;
-    reader["failIfExtra"] = false;
-    auto body_view = req->getBody();
-    std::istringstream stream(std::string(body_view.begin(), body_view.end()));
-    Json::Value body;
-    std::string errs;
-    if (!Json::parseFromStream(reader, stream, &body, &errs) ||
-        !body.isObject()) {
-        throw std::runtime_error("Invalid JSON request body: " + errs);
-    }
-    return body;
-}
-
 const char* video_job_status_name(VideoJobStatus s) {
     switch (s) {
         case VideoJobStatus::queued: return "queued";
@@ -1324,7 +1307,7 @@ const char* video_job_status_name(VideoJobStatus s) {
         case VideoJobStatus::completed: return "completed";
         case VideoJobStatus::failed: return "failed";
     }
-    return "queued";
+    __builtin_unreachable();
 }
 
 Json::Value video_job_json(const VideoJob& job) {
@@ -1334,7 +1317,7 @@ Json::Value video_job_json(const VideoJob& job) {
     out["model"] = job.model_id;
     out["prompt"] = job.prompt;
     out["status"] = video_job_status_name(job.status);
-    out["created_at"] = static_cast<int>(job.created_at);
+    out["created_at"] = static_cast<std::int64_t>(job.created_at);
     if (job.size.empty()) {
         out["size"] = Json::Value();
     } else {
@@ -1352,7 +1335,7 @@ Json::Value video_job_json(const VideoJob& job) {
             ? 100
             : 0;
     if (job.completed_at) {
-        out["completed_at"] = static_cast<int>(job.completed_at);
+        out["completed_at"] = static_cast<std::int64_t>(job.completed_at);
     }
     if (job.inference_time_s > 0.0) {
         out["inference_time_s"] = job.inference_time_s;
@@ -1380,7 +1363,7 @@ Json::Value video_job_json(const VideoJob& job) {
 // <id>.mp4 (additional outputs as <id>_N.mp4) and updates the job status.
 // Returns an empty string on success, otherwise the error message; the job is
 // marked failed in that case.
-std::string run_video_job(VideoGenerationModel* model,
+std::string run_video_job(std::shared_ptr<VideoGenerationModel> model,
                           const VideoGenerateOptions& opts,
                           const std::string& id) {
     std::string error;
@@ -1684,7 +1667,7 @@ void registerVideoGenerations(drogon::HttpAppFramework& app) {
                                         .filename()
                                         .string();
                                 item["expiry"] =
-                                    static_cast<int>(std::time(nullptr)) + 86400;
+                                    static_cast<std::int64_t>(std::time(nullptr)) + 86400;
                                 item["b64_json"] = Json::nullValue;
                                 data.append(item);
                             }
@@ -1692,7 +1675,7 @@ void registerVideoGenerations(drogon::HttpAppFramework& app) {
                         Json::Value out;
                         out["id"] = id;
                         out["object"] = "video";
-                        out["created"] = static_cast<int>(std::time(nullptr));
+                        out["created"] = static_cast<std::int64_t>(std::time(nullptr));
                         out["model"] = model->id();
                         out["status"] = "completed";
                         out["error"] = Json::nullValue;
@@ -1732,16 +1715,13 @@ void registerAudioTranscriptions(drogon::HttpAppFramework& app) {
             }
 
             try {
-                ASRModel* model = nullptr;
+                std::shared_ptr<ASRModel> model;
                 const auto& params = parser.getParameters();
                 auto model_it = params.find("model");
                 const std::string requested =
                     model_it == params.end() ? std::string{} : model_it->second;
                 if (requested.empty()) {
-                    auto& models = ModelManager::instance().all_asr();
-                    if (models.size() == 1) {
-                        model = models.begin()->second.get();
-                    }
+                    model = single_model(ModelManager::instance().all_asr());
                 } else {
                     model = ModelManager::instance().get_asr(requested);
                 }
@@ -1835,10 +1815,6 @@ void registerAudioTranscriptions(drogon::HttpAppFramework& app) {
                     //   data: {"type":"transcript.text.delta","delta":...}
                     //   data: {"type":"transcript.text.done","text":...,"usage":...}
                     //   data: [DONE]
-                    struct StreamState {
-                        std::shared_ptr<drogon::ResponseStream> stream;
-                        std::mutex mutex;
-                    };
                     auto state = std::make_shared<StreamState>();
                     drogon::HttpResponsePtr resp =
                         drogon::HttpResponse::newAsyncStreamResponse(
@@ -1850,17 +1826,7 @@ void registerAudioTranscriptions(drogon::HttpAppFramework& app) {
                                 // Returns false if the client is gone.
                                 auto send_event =
                                     [state](const std::string& payload) {
-                                        std::lock_guard lock(state->mutex);
-                                        auto s = state->stream;
-                                        if (!s) {
-                                            return false;
-                                        }
-                                        const bool ok =
-                                            s->send(sse_message(payload));
-                                        if (!ok) {
-                                            state->stream.reset();
-                                        }
-                                        return ok;
+                                        return send_sse(state, payload);
                                     };
 
                                 auto worker =
@@ -1876,15 +1842,12 @@ void registerAudioTranscriptions(drogon::HttpAppFramework& app) {
                                             ASROnText on_text =
                                                 [send_event](
                                                     const std::string& delta) {
-                                                    Json::StreamWriterBuilder b;
-                                                    b["indentation"] = "";
                                                     Json::Value ev;
                                                     ev["type"] =
                                                         "transcript.text.delta";
                                                     ev["delta"] = delta;
                                                     const bool ok = send_event(
-                                                        Json::writeString(
-                                                            b, ev));
+                                                        compact_json(ev));
                                                     return ok
                                                                ? ov::genai::
                                                                      StreamingStatus::
@@ -1896,8 +1859,6 @@ void registerAudioTranscriptions(drogon::HttpAppFramework& app) {
                                             result =
                                                 model->generate(opts, on_text);
 
-                                            Json::StreamWriterBuilder b;
-                                            b["indentation"] = "";
                                             Json::Value done;
                                             done["type"] =
                                                 "transcript.text.done";
@@ -1909,12 +1870,9 @@ void registerAudioTranscriptions(drogon::HttpAppFramework& app) {
                                                     int64_t>(duration_s);
                                                 done["usage"] = usage;
                                             }
-                                            send_event(
-                                                Json::writeString(b, done));
+                                            send_event(compact_json(done));
                                             send_event("[DONE]");
                                         } catch (const std::exception& e) {
-                                            Json::StreamWriterBuilder b;
-                                            b["indentation"] = "";
                                             Json::Value err;
                                             err["type"] = "error";
                                             Json::Value msg;
@@ -1922,8 +1880,7 @@ void registerAudioTranscriptions(drogon::HttpAppFramework& app) {
                                                 "Failed to transcribe audio: " +
                                                 std::string(e.what());
                                             err["error"] = msg;
-                                            send_event(
-                                                Json::writeString(b, err));
+                                            send_event(compact_json(err));
                                         }
                                         std::lock_guard lock(state->mutex);
                                         if (state->stream) {
@@ -1934,8 +1891,6 @@ void registerAudioTranscriptions(drogon::HttpAppFramework& app) {
                                 try {
                                     pool().enqueue(worker);
                                 } catch (const std::exception& e) {
-                                    Json::StreamWriterBuilder b;
-                                    b["indentation"] = "";
                                     Json::Value err;
                                     err["type"] = "error";
                                     Json::Value msg;
@@ -1943,7 +1898,7 @@ void registerAudioTranscriptions(drogon::HttpAppFramework& app) {
                                         "Failed to transcribe audio: " +
                                         std::string(e.what());
                                     err["error"] = msg;
-                                    send_event(Json::writeString(b, err));
+                                    send_event(compact_json(err));
                                     std::lock_guard lock(state->mutex);
                                     if (state->stream) {
                                         state->stream->close();
@@ -2015,27 +1970,20 @@ void registerAudioSpeech(drogon::HttpAppFramework& app) {
         "/v1/audio/speech",
         [](const drogon::HttpRequestPtr& req,
            std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
-            Json::CharReaderBuilder reader;
-            reader["failIfExtra"] = false;
-            auto body_view = req->getBody();
-            std::istringstream stream(std::string(body_view.begin(), body_view.end()));
             Json::Value body;
-            std::string errs;
-            if (!Json::parseFromStream(reader, stream, &body, &errs) ||
-                !body.isObject()) {
-                callback(error_response("Invalid JSON request body: " + errs,
-                                        drogon::k400BadRequest));
+            try {
+                body = parse_json_body(req);
+            } catch (const std::exception& e) {
+                callback(error_response(e.what(), drogon::k400BadRequest));
                 return;
             }
 
             try {
                 const std::string text = getString(body, "input");
-                TTSModel* model = nullptr;
+                std::shared_ptr<TTSModel> model;
                 if (!body.isMember("model")) {
-                    auto& models = ModelManager::instance().all_tts();
-                    if (models.size() == 1) {
-                        model = models.begin()->second.get();
-                    }
+                    model = single_model(
+                        ModelManager::instance().all_tts());
                 } else if (body["model"].isString()) {
                     model = ModelManager::instance().get_tts(body["model"].asString());
                 }

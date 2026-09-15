@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -13,21 +14,34 @@
 
 namespace ovserver {
 
-// Device-level inference tuning shared by every GenAI pipeline.
-struct GpuTuning {
-    ov::element::Type kv_cache_precision{ov::element::u8};
-    std::uint64_t dynamic_quantization_group_size{32};
-    bool enable_sdpa_optimization{true};
-};
+// Parses and stores device-scoped inference properties supplied on the command
+// line as JSON, e.g. --device-props '{"gpu":{"KV_CACHE_PRECISION":"u8"}}'.
+// Top-level keys are device names (matched case-insensitively against the
+// device OpenVINO reports, so "gpu" matches "GPU"); their values are OpenVINO
+// property maps forwarded to the GenAI pipeline verbatim — per-device
+// construction is the caller's job. Throws std::runtime_error on malformed
+// input.
+void set_device_props(const std::string& json);
 
-// Builds the property map forwarded to a GenAI pipeline: the model cache dir
-// plus GPU-specific tuning (u8 KV cache, dynamic quantization, SDPA
-// optimization) when the target is the Intel GPU plugin. Other devices get the
-// cache dir only, since these hints are rejected at compile time by non-GPU
-// plugins.
+// Builds the property map forwarded to a GenAI pipeline: always the model
+// cache dir; when the storage set by set_device_props() carries an entry for
+// `device`, those properties are wrapped in ov::device::properties so they are
+// scoped to that device. Non-matching devices get the cache dir only.
 ov::AnyMap inference_properties(const std::string& device,
-                                const std::string& cache_dir,
-                                const GpuTuning& gpu = {});
+                                const std::string& cache_dir);
+
+// Quotes a string for safe inclusion in a single-quoted shell command built
+// with /bin/sh: wraps it in double quotes and backslash-escapes the characters
+// the shell would otherwise interpret (" \ $ `).
+std::string shell_quote(const std::string& value);
+
+// Builds the denoising-step progress callback shared by the image and video
+// pipelines. Each invocation logs "[tag model 'id'] request N step X/Y: Ds".
+std::function<bool(std::size_t, std::size_t, ov::Tensor&)> step_logger(
+    const std::string& tag,
+    const std::string& id,
+    std::uint64_t req_id,
+    std::chrono::steady_clock::time_point start);
 
 // Prints the standard post-load memory line, e.g.
 //     [image model 'sdxl'] memory: GPU 3.79 GiB

@@ -5,7 +5,6 @@
 
 #include <chrono>
 #include <iostream>
-#include <sstream>
 
 #include <openvino/genai/automatic_speech_recognition/pipeline.hpp>
 
@@ -17,12 +16,12 @@ ASRModel::ASRModel(const std::string& id,
                    const std::filesystem::path& models_path,
                    const std::string& device,
                    const std::string& cache_dir)
-    : m_id(id), m_models_path(models_path), m_device(device) {
-    PipelineLoadLog load_log("asr", id, m_models_path, m_device);
+    : m_id(id) {
+    PipelineLoadLog load_log("asr", id, models_path, device);
     try {
         m_pipeline = std::make_shared<ov::genai::ASRPipeline>(
-            m_models_path.string(), m_device,
-            inference_properties(m_device, cache_dir));
+            models_path.string(), device,
+            inference_properties(device, cache_dir));
     } catch (const std::exception& e) {
         std::cerr << "[asr model '" << id << "'] loading FAILED: " << e.what()
                   << std::endl;

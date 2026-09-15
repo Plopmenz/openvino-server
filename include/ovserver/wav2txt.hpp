@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -71,12 +72,10 @@ public:
 
 private:
     std::string m_id;
-    std::filesystem::path m_models_path;
-    std::string m_device;
 
     std::mutex m_mutex;
     std::shared_ptr<ov::genai::ASRPipeline> m_pipeline;
-    std::uint64_t m_next_req_id = 0;
+    std::atomic<std::uint64_t> m_next_req_id{0};
 };
 
 struct ASRSpec {
