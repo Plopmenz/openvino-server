@@ -44,6 +44,10 @@ struct TextGenerateOptions {
     // OpenAI "tools" definitions (function calling). When set they are injected
     // into the chat template via ChatHistory::set_tools().
     std::optional<ov::genai::JsonContainer> tools;
+    // OpenAI "chat_template_kwargs": extra key/value pairs passed into the
+    // model's Jinja chat template (extra_context).  Useful for toggling
+    // template-level flags (e.g. {"enable_thinking": false}).
+    std::optional<ov::genai::JsonContainer> chat_template_kwargs;
     // OpenAI "response_format": constrains generation so the output matches a
     // JSON schema / regex / EBNF grammar (structured output, xgrammar backend).
     std::optional<ov::genai::StructuredOutputConfig> structured_output;
@@ -147,6 +151,10 @@ private:
     ov::genai::Tokenizer m_tokenizer;
     ReasoningMarkers m_reasoning;
     bool m_tools_supported = false;
+    // Defaults seeded from the model's generation_config.json (if present), the
+    // same way OVMS builds its base GenerationConfig. Per-request overrides are
+    // applied on top inside generate().
+    ov::genai::GenerationConfig m_base_generation_cfg;
     // Speculative-decoding strategy active for this pipeline (drives which
     // GenerationConfig fields generate() sets per request).
     bool m_prompt_lookup_active = false;

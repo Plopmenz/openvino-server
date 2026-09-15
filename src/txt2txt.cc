@@ -468,6 +468,15 @@ TextGenerationModel::TextGenerationModel(const std::string& id,
         m_pipeline = std::make_shared<ov::genai::ContinuousBatchingPipeline>(
             m_models_path, sched_cfg, m_device, props);
         m_tokenizer = m_pipeline->get_tokenizer();
+        // Seed per-request generation defaults from the model's own
+        // generation_config.json, mirroring OVMS's baseGenerationConfig.
+        // Request-level overrides then apply on top of these.
+        const std::filesystem::path generation_config_path =
+            m_models_path / "generation_config.json";
+        if (std::filesystem::exists(generation_config_path)) {
+            m_base_generation_cfg =
+                ov::genai::GenerationConfig(generation_config_path.string());
+        }
         detect_parsers();
     } catch (const std::exception& e) {
         std::cerr << "[text model '" << id << "'] loading FAILED: " << e.what()
@@ -493,6 +502,18 @@ TextGenerationModel::~TextGenerationModel() {
 std::uint64_t TextGenerationModel::next_request_id() {
     std::lock_guard<std::mutex> lock(m_id_mutex);
     return m_next_id++;
+}
+
+// True when the request's chat_template_kwargs carry an explicit
+// "enable_thinking": false, i.e. the model is asked to answer without a
+// reasoning block.
+bool chat_template_disables_thinking(
+    const std::optional<ov::genai::JsonContainer>& kwargs) {
+    if (!kwargs || !kwargs->is_object() || !kwargs->contains("enable_thinking")) {
+        return false;
+    }
+    const auto value = (*kwargs)["enable_thinking"].as_bool();
+    return value && !*value;
 }
 
 // Auto-detects the reasoning markers and the tool-call format for this model so
@@ -647,20 +668,18 @@ void TextGenerationModel::snapshot_log(
 }
 
 TextResult TextGenerationModel::generate(const TextGenerateOptions& opts) {
-    ov::genai::GenerationConfig cfg;
+    // Seed generation defaults from the model's own generation_config.json
+    // (loaded at startup), the same way OVMS builds its baseGenerationConfig.
+    // Request-level fields below override these on a per-call basis.
+    ov::genai::GenerationConfig cfg = m_base_generation_cfg;
+    // The prompt string we submit to the pipeline is already rendered by the
+    // model's chat template above; disable the pipeline's own templating step
+    // so it does not re-wrap the rendered prompt as a user turn.
+    cfg.apply_chat_template = false;
     if (opts.max_new_tokens) cfg.max_new_tokens = *opts.max_new_tokens;
-    if (opts.temperature) {
-        cfg.temperature = *opts.temperature;
-        cfg.do_sample = true;
-    }
-    if (opts.top_p) {
-        cfg.top_p = *opts.top_p;
-        cfg.do_sample = true;
-    }
-    if (opts.top_k) {
-        cfg.top_k = *opts.top_k;
-        cfg.do_sample = true;
-    }
+    if (opts.temperature) cfg.temperature = *opts.temperature;
+    if (opts.top_p) cfg.top_p = *opts.top_p;
+    if (opts.top_k) cfg.top_k = *opts.top_k;
     if (opts.rng_seed) cfg.rng_seed = *opts.rng_seed;
     if (!opts.stop_strings.empty()) cfg.stop_strings = opts.stop_strings;
     if (opts.frequency_penalty) cfg.frequency_penalty = *opts.frequency_penalty;
@@ -674,6 +693,10 @@ TextResult TextGenerationModel::generate(const TextGenerateOptions& opts) {
     } else if (m_mtp_active) {
         cfg.num_assistant_tokens = m_num_assistant_tokens;
     }
+    // Multinomial sampling is on only when the (possibly overridden)
+    // temperature is strictly positive and no beam search is requested,
+    // matching how OVMS derives do_sample after applying request overrides.
+    cfg.do_sample = cfg.temperature > 0.0f && cfg.num_beams == 1;
 
     // Apply the model's own chat template so role framing matches training.
     // A full OpenAI-style conversation history (including assistant tool_calls
@@ -691,6 +714,9 @@ TextResult TextGenerationModel::generate(const TextGenerateOptions& opts) {
     }
     if (opts.tools) {
         history.set_tools(*opts.tools);
+    }
+    if (opts.chat_template_kwargs) {
+        history.set_extra_context(*opts.chat_template_kwargs);
     }
     const std::string templated =
         m_tokenizer.apply_chat_template(history, /*add_generation_prompt=*/true);
@@ -717,27 +743,38 @@ TextResult TextGenerationModel::generate(const TextGenerateOptions& opts) {
     std::string reasoning_accumulated;
     ov::genai::GenerationFinishReason finish =
         ov::genai::GenerationFinishReason::NONE;
-    // Separate reasoning from visible content only when a client consumes it;
-    // otherwise the raw stream (including markers) is forwarded unchanged.
-    const bool split_stream =
-        m_reasoning.enabled && opts.on_reasoning != nullptr;
+    // Split reasoning from visible content only when the request does not
+    // disable thinking. With `expect_open_tag=false` splitters (Qwen3.5/3.6,
+    // DeepSeek) the splitter starts *inside* the reasoning section, so a
+    // request that disables thinking via chat_template_kwargs
+    // (enable_thinking:false) must skip splitting entirely: its marker-free
+    // plain output would otherwise be misrouted to reasoning_content.
+    //
+    // `split_reasoning` gates the splitter entirely.  When true the single
+    // splitter instance handles both streaming and non-streaming: words are
+    // always accumulated via callbacks; only when the request provides an
+    // on_reasoning callback do we also deliver fragments incrementally.
+    const bool split_reasoning =
+        m_reasoning.enabled &&
+        !chat_template_disables_thinking(opts.chat_template_kwargs);
+    const bool deliver_incrementally = split_reasoning && opts.on_reasoning != nullptr;
     ReasoningStreamSplitter splitter(m_reasoning.expect_open_tag,
                                      m_reasoning.open_tag,
                                      m_reasoning.close_tag);
     auto on_word = [&](std::string word) -> ov::genai::CallbackTypeVariant {
-        if (split_stream) {
+        if (split_reasoning) {
             const bool ok = splitter.feed(
                 word,
-                [&accumulated, &opts](std::string w) {
+                [&accumulated, &opts, deliver_incrementally](std::string w) {
                     accumulated += w;
-                    if (opts.on_text) {
+                    if (deliver_incrementally && opts.on_text) {
                         return opts.on_text(std::move(w));
                     }
                     return true;
                 },
-                [&reasoning_accumulated, &opts](std::string w) {
+                [&reasoning_accumulated, &opts, deliver_incrementally](std::string w) {
                     reasoning_accumulated += w;
-                    if (opts.on_reasoning) {
+                    if (deliver_incrementally && opts.on_reasoning) {
                         return opts.on_reasoning(std::move(w));
                     }
                     return true;
@@ -808,53 +845,25 @@ TextResult TextGenerationModel::generate(const TextGenerateOptions& opts) {
     }
     streamer->end();
 
-    if (split_stream && !aborted) {
-        // Deliver any tail text held back for a possibly-marker-prefix.
+    if (!aborted && split_reasoning) {
+        // Flush any tail text held back for a possibly-marker-prefix.
+        // The callbacks accumulate into accumulated/reasoning_accumulated
+        // (non-streaming) and also deliver incrementally when streaming.
         splitter.flush(
-            [&accumulated, &opts](std::string w) {
+            [&accumulated, &opts, deliver_incrementally](std::string w) {
                 accumulated += w;
-                if (opts.on_text) {
+                if (deliver_incrementally && opts.on_text) {
                     return opts.on_text(std::move(w));
                 }
                 return true;
             },
-            [&reasoning_accumulated, &opts](std::string w) {
+            [&reasoning_accumulated, &opts, deliver_incrementally](std::string w) {
                 reasoning_accumulated += w;
-                if (opts.on_reasoning) {
+                if (deliver_incrementally && opts.on_reasoning) {
                     return opts.on_reasoning(std::move(w));
                 }
                 return true;
             });
-    } else if (!split_stream && !aborted) {
-        // Non-streaming: split the complete output once so reasoning_content is
-        // still populated even though nothing was streamed.
-        if (m_reasoning.enabled) {
-            ReasoningStreamSplitter full(m_reasoning.expect_open_tag,
-                                         m_reasoning.open_tag,
-                                         m_reasoning.close_tag);
-            std::string content;
-            std::string reasoning;
-            full.feed(accumulated,
-                      [&content](std::string w) {
-                          content += w;
-                          return true;
-                      },
-                      [&reasoning](std::string w) {
-                          reasoning += w;
-                          return true;
-                      });
-            full.flush(
-                [&content](std::string w) {
-                    content += w;
-                    return true;
-                },
-                [&reasoning](std::string w) {
-                    reasoning += w;
-                    return true;
-                });
-            accumulated = std::move(content);
-            reasoning_accumulated = std::move(reasoning);
-        }
     }
 
     const auto gen_end = std::chrono::steady_clock::now();

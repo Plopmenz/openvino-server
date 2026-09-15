@@ -773,6 +773,17 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                         opts.tools = json_to_genai(tools);
                     }
                 }
+                // "chat_template_kwargs": extra key/value pairs forwarded
+                // to the model's Jinja chat template (extra_context).
+                if (body.isMember("chat_template_kwargs") &&
+                    !body["chat_template_kwargs"].isNull()) {
+                    if (!body["chat_template_kwargs"].isObject()) {
+                        throw std::runtime_error(
+                            "'chat_template_kwargs' must be an object");
+                    }
+                    opts.chat_template_kwargs =
+                        json_to_genai(body["chat_template_kwargs"]);
+                }
                 // Number of independent completions to sample. Streaming several
                 // concurrent generations in one SSE stream is not supported.
                 std::size_t n_choices = 1;
