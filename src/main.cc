@@ -329,8 +329,16 @@ int main(int argc, char** argv) {
 
     try {
         const std::filesystem::path p(model_path);
-        const std::string id =
-            model_id.empty() ? p.filename().string() : model_id;
+        std::string id = model_id;
+        if (id.empty()) {
+            // Strip trailing separators so `--model /dir/of/model/` still
+            // derives a sensible default id from the directory name.
+            std::string dir = model_path;
+            while (dir.size() > 1 && dir.back() == '/') {
+                dir.pop_back();
+            }
+            id = std::filesystem::path(dir).filename().string();
+        }
         if (enable_txt2img) {
             ovserver::ModelManager::instance().load_image(id, {p, device, cache_dir});
             LOG_INFO << "Image model '" << id

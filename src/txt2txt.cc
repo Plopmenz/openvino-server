@@ -527,24 +527,11 @@ void TextGenerationModel::detect_parsers() {
     }();
 
 // --- Reasoning markers -----------------------------------------------
-    if (tmpl_lower.find(" response") != std::string::npos ||
-        family.find("deepseek") != std::string::npos ||
-        tmpl_lower.find("reasoning_content") != std::string::npos ||
-        tmpl_lower.find(" reasoning") != std::string::npos) {
-        // Qwen3.5 / Qwen3.6 / DeepSeek-R1 (and distills): the reasoning block
-        // closes with " response", and the open tag is injected by the template
-        // (or history), so generation starts inside the reasoning section.
+    if (tmpl_lower.find("</think>") != std::string::npos) {
         m_reasoning = ReasoningMarkers{/*enabled=*/true,
                                        /*expect_open_tag=*/false,
                                        /*open_tag=*/"",
-                                       /*close_tag=*/" response"};
-    } else if (tmpl_lower.find(" thinking") != std::string::npos ||
-               tmpl_lower.find("thinking") != std::string::npos) {
-        // Qwen3 (and Qwen3-style) models emit " thinking ...  response".
-        m_reasoning = ReasoningMarkers{/*enabled=*/true,
-                                       /*expect_open_tag=*/true,
-                                       /*open_tag=*/" thinking",
-                                       /*close_tag=*/" response"};
+                                       /*close_tag=*/"\n</think>\n\n"};
     }
 
     // --- Tool calling -------------------------------------------------------
@@ -559,7 +546,7 @@ void TextGenerationModel::detect_parsers() {
             std::cerr << "'" << m_reasoning.open_tag << "' / '"
                       << m_reasoning.close_tag << "' (expect open tag)";
         } else {
-            std::cerr << "'<start>' / '" << m_reasoning.close_tag
+            std::cerr << "'' / '" << m_reasoning.close_tag
                       << "' (no open tag)";
         }
     } else {
