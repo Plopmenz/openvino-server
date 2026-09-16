@@ -19,14 +19,18 @@
 #include "ovserver/qwen3_tts.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <random>
 #include <stdexcept>
 
 #include <json/json.h>
+
+#include "ovserver/common.hpp"
 
 namespace ovserver {
 
@@ -89,6 +93,7 @@ struct Qwen3TTSModel::Impl {
     int max_new_tokens = 8192;
 
     std::mutex mtx;
+    std::uint64_t next_req_id = 0;
 };
 
 namespace {
@@ -318,59 +323,67 @@ Qwen3TTSModel::Qwen3TTSModel(const std::string& id,
     Impl& p = *m_impl;
     p.device = device;
 
-    if (!std::filesystem::is_directory(m_models_path))
-        throw std::runtime_error("qwen3_tts: models path is not a directory: " +
-                                 m_models_path.string());
-
+    PipelineLoadLog load_log("tts", id, m_models_path, m_device);
     try {
-        const auto gc_path = m_models_path / "generation_config.json";
-        if (std::filesystem::exists(gc_path)) {
-            std::ifstream fin(gc_path);
-            Json::Value j;
-            fin >> j;
-            p.do_sample = j.get("do_sample", true).asBool();
-            p.temperature = j.get("temperature", 0.9).asDouble();
-            p.top_k = j.get("top_k", 50).asInt();
-            p.top_p = j.get("top_p", 1.0).asDouble();
-            p.repetition_penalty = j.get("repetition_penalty", 1.05).asDouble();
-            p.subtalker_dosample = j.get("subtalker_dosample", true).asBool();
-            p.subtalker_temperature = j.get("subtalker_temperature", 0.9).asDouble();
-            p.subtalker_top_k = j.get("subtalker_top_k", 50).asInt();
-            p.subtalker_top_p = j.get("subtalker_top_p", 1.0).asDouble();
-            p.max_new_tokens = j.get("max_new_tokens", 8192).asInt();
+        if (!std::filesystem::is_directory(m_models_path))
+            throw std::runtime_error("qwen3_tts: models path is not a directory: " +
+                                     m_models_path.string());
+
+        try {
+            const auto gc_path = m_models_path / "generation_config.json";
+            if (std::filesystem::exists(gc_path)) {
+                std::ifstream fin(gc_path);
+                Json::Value j;
+                fin >> j;
+                p.do_sample = j.get("do_sample", true).asBool();
+                p.temperature = j.get("temperature", 0.9).asDouble();
+                p.top_k = j.get("top_k", 50).asInt();
+                p.top_p = j.get("top_p", 1.0).asDouble();
+                p.repetition_penalty = j.get("repetition_penalty", 1.05).asDouble();
+                p.subtalker_dosample = j.get("subtalker_dosample", true).asBool();
+                p.subtalker_temperature = j.get("subtalker_temperature", 0.9).asDouble();
+                p.subtalker_top_k = j.get("subtalker_top_k", 50).asInt();
+                p.subtalker_top_p = j.get("subtalker_top_p", 1.0).asDouble();
+                p.max_new_tokens = j.get("max_new_tokens", 8192).asInt();
+            }
+        } catch (...) {
+            // fall back to defaults
         }
-    } catch (...) {
-        // fall back to defaults
+
+        const auto vocab = m_models_path / "vocab.json";
+        const auto merges = m_models_path / "merges.txt";
+        if (!p.bpe.load(vocab, merges))
+            throw std::runtime_error("qwen3_tts: failed to load tokenizer (" +
+                                     vocab.string() + ", " + merges.string() + ")");
+
+        p.core = ov::Core();
+        if (!m_cache_dir.empty())
+            p.core.set_property(ov::cache_dir(m_cache_dir));
+
+        auto cm = [&p](const std::filesystem::path& xml) {
+            return p.core.compile_model(xml, p.device);
+        };
+
+        ov::CompiledModel text = cm(m_models_path / "text_model.xml");
+        ov::CompiledModel codec = cm(m_models_path / "codec_embedding.xml");
+        ov::CompiledModel cpc = cm(m_models_path / "cp_codec_embedding.xml");
+        ov::CompiledModel talker = cm(m_models_path / "talker.xml");
+        ov::CompiledModel cpred = cm(m_models_path / "code_predictor.xml");
+        ov::CompiledModel dec =
+            cm(m_models_path / "speech_tokenizer" / "speech_decoder.xml");
+
+        p.r_text = text.create_infer_request();
+        p.r_codec = codec.create_infer_request();
+        p.r_cp_codec = cpc.create_infer_request();
+        p.r_talker = talker.create_infer_request();
+        p.r_cp = cpred.create_infer_request();
+        p.r_decoder = dec.create_infer_request();
+    } catch (const std::exception& e) {
+        std::cerr << "[tts model '" << id << "'] loading FAILED: " << e.what()
+                  << std::endl;
+        throw;
     }
-
-    const auto vocab = m_models_path / "vocab.json";
-    const auto merges = m_models_path / "merges.txt";
-    if (!p.bpe.load(vocab, merges))
-        throw std::runtime_error("qwen3_tts: failed to load tokenizer (" +
-                                 vocab.string() + ", " + merges.string() + ")");
-
-    p.core = ov::Core();
-    if (!m_cache_dir.empty())
-        p.core.set_property(ov::cache_dir(m_cache_dir));
-
-    auto cm = [&p](const std::filesystem::path& xml) {
-        return p.core.compile_model(xml, p.device);
-    };
-
-    ov::CompiledModel text = cm(m_models_path / "text_model.xml");
-    ov::CompiledModel codec = cm(m_models_path / "codec_embedding.xml");
-    ov::CompiledModel cpc = cm(m_models_path / "cp_codec_embedding.xml");
-    ov::CompiledModel talker = cm(m_models_path / "talker.xml");
-    ov::CompiledModel cpred = cm(m_models_path / "code_predictor.xml");
-    ov::CompiledModel dec =
-        cm(m_models_path / "speech_tokenizer" / "speech_decoder.xml");
-
-    p.r_text = text.create_infer_request();
-    p.r_codec = codec.create_infer_request();
-    p.r_cp_codec = cpc.create_infer_request();
-    p.r_talker = talker.create_infer_request();
-    p.r_cp = cpred.create_infer_request();
-    p.r_decoder = dec.create_infer_request();
+    load_log.completion();
 }
 
 Qwen3TTSModel::~Qwen3TTSModel() = default;
@@ -379,6 +392,11 @@ TTSResult Qwen3TTSModel::generate(const std::string& text,
                                   const ov::Tensor& speaker_embedding) {
     std::lock_guard<std::mutex> lock(m_impl->mtx);
     Impl& p = *m_impl;
+
+    const std::uint64_t req_id = p.next_req_id++;
+    std::cerr << "[tts model '" << m_id << "'] request " << req_id << " start"
+              << std::endl;
+    const auto t0 = std::chrono::steady_clock::now();
 
     TTSResult result;
     result.sample_rate = kSampleRate;
@@ -555,51 +573,62 @@ TTSResult Qwen3TTSModel::generate(const std::string& text,
     }
 
     // ---- Chunked speech-codec decode ----
-    if (frames.empty()) return result;
+    if (!frames.empty()) {
+        const std::size_t F = frames.size();
+        std::vector<float> samples;
+        std::size_t start = 0;
+        while (start < F) {
+            const std::size_t end = std::min(start + kDecoderChunk, F);
+            const std::size_t ctx = start > static_cast<std::size_t>(kDecoderLeftCtx)
+                                        ? static_cast<std::size_t>(kDecoderLeftCtx)
+                                        : start;
+            const std::size_t chunk_len = end - (start - ctx);
+            const std::size_t rows = chunk_len < kDecoderTraceLen ? kDecoderTraceLen
+                                                                  : chunk_len;
 
-    const std::size_t F = frames.size();
-    std::vector<float> samples;
-    std::size_t start = 0;
-    while (start < F) {
-        const std::size_t end = std::min(start + kDecoderChunk, F);
-        const std::size_t ctx = start > static_cast<std::size_t>(kDecoderLeftCtx)
-                                    ? static_cast<std::size_t>(kDecoderLeftCtx)
-                                    : start;
-        const std::size_t chunk_len = end - (start - ctx);
-        const std::size_t rows = chunk_len < kDecoderTraceLen ? kDecoderTraceLen
-                                                              : chunk_len;
+            std::vector<std::int64_t> codes(static_cast<std::size_t>(kNumCodeGroups) * rows, 0);
+            // codes[n] layout [num_groups][rows]; frames[r] is [16] group ids.
+            for (std::size_t r = 0; r < chunk_len; ++r) {
+                const auto& fm = frames[start - ctx + r];
+                for (int g = 0; g < kNumCodeGroups; ++g)
+                    codes[static_cast<std::size_t>(g) * rows + r] = fm[static_cast<std::size_t>(g)];
+            }
 
-        std::vector<std::int64_t> codes(static_cast<std::size_t>(kNumCodeGroups) * rows, 0);
-        // codes[n] layout [num_groups][rows]; frames[r] is [16] group ids.
-        for (std::size_t r = 0; r < chunk_len; ++r) {
-            const auto& fm = frames[start - ctx + r];
-            for (int g = 0; g < kNumCodeGroups; ++g)
-                codes[static_cast<std::size_t>(g) * rows + r] = fm[static_cast<std::size_t>(g)];
+            ov::Tensor ct(ov::element::i64,
+                          {1, static_cast<std::size_t>(kNumCodeGroups), rows});
+            std::memcpy(ct.data(), codes.data(), codes.size() * sizeof(std::int64_t));
+            p.r_decoder.set_tensor("codes", ct);
+            p.r_decoder.infer();
+            std::vector<float> wav = copy_f32(p.r_decoder.get_tensor("waveform"));
+
+            const std::size_t total_valid = chunk_len * kDecoderUpsample - kDecoderOffset;
+            const std::size_t ctx_samples = ctx * kDecoderUpsample;
+            if (total_valid > ctx_samples && total_valid <= wav.size())
+                samples.insert(samples.end(), wav.begin() +
+                                                  static_cast<std::ptrdiff_t>(ctx_samples),
+                               wav.begin() + static_cast<std::ptrdiff_t>(total_valid));
+
+            start = end;
         }
 
-        ov::Tensor ct(ov::element::i64,
-                      {1, static_cast<std::size_t>(kNumCodeGroups), rows});
-        std::memcpy(ct.data(), codes.data(), codes.size() * sizeof(std::int64_t));
-        p.r_decoder.set_tensor("codes", ct);
-        p.r_decoder.infer();
-        std::vector<float> wav = copy_f32(p.r_decoder.get_tensor("waveform"));
-
-        const std::size_t total_valid = chunk_len * kDecoderUpsample - kDecoderOffset;
-        const std::size_t ctx_samples = ctx * kDecoderUpsample;
-        if (total_valid > ctx_samples && total_valid <= wav.size())
-            samples.insert(samples.end(), wav.begin() +
-                                              static_cast<std::ptrdiff_t>(ctx_samples),
-                           wav.begin() + static_cast<std::ptrdiff_t>(total_valid));
-
-        start = end;
+        result.samples.resize(samples.size());
+        for (std::size_t i = 0; i < samples.size(); ++i) {
+            const long s = std::lround(samples[i] * 32767.0);
+            result.samples[i] = static_cast<std::int16_t>(
+                std::clamp(s, -32768L, 32767L));
+        }
     }
 
-    result.samples.resize(samples.size());
-    for (std::size_t i = 0; i < samples.size(); ++i) {
-        const long s = std::lround(samples[i] * 32767.0);
-        result.samples[i] = static_cast<std::int16_t>(
-            std::clamp(s, -32768L, 32767L));
-    }
+    const double elapsed = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+    const double audio_s =
+        static_cast<double>(result.samples.size()) /
+        static_cast<double>(kSampleRate);
+    std::cerr << "[tts model '" << m_id << "'] request " << req_id
+              << " finished in " << elapsed << " s audio_s=" << audio_s
+              << " ratio=" << (elapsed > 0 ? audio_s / elapsed : 0.0) << "x"
+              << std::endl;
     return result;
 }
 
