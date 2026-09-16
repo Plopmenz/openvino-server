@@ -35,6 +35,7 @@
 #include "ovserver/image_decode.hpp"
 #include "ovserver/manager.hpp"
 #include "ovserver/txt2wav.hpp"
+#include "ovserver/qwen3_tts.hpp"
 #include "ovserver/txt2img.hpp"
 #include "ovserver/txt2txt.hpp"
 #include "ovserver/txt2vid.hpp"
@@ -366,6 +367,11 @@ void registerModels(drogon::HttpAppFramework& app) {
                             }
                             for (const auto& [id, model] :
                                  ModelManager::instance().all_tts()) {
+                                (void)model;
+                                append_model_entry(arr, id);
+                            }
+                            for (const auto& [id, model] :
+                                 ModelManager::instance().all_qwen3_tts()) {
                                 (void)model;
                                 append_model_entry(arr, id);
                             }
@@ -1981,13 +1987,21 @@ void registerAudioSpeech(drogon::HttpAppFramework& app) {
             try {
                 const std::string text = getString(body, "input");
                 std::shared_ptr<TTSModel> model;
+                std::shared_ptr<Qwen3TTSModel> qwen3_model;
                 if (!body.isMember("model")) {
                     model = single_model(
                         ModelManager::instance().all_tts());
+                    qwen3_model = single_model(
+                        ModelManager::instance().all_qwen3_tts());
                 } else if (body["model"].isString()) {
-                    model = ModelManager::instance().get_tts(body["model"].asString());
+                    qwen3_model = ModelManager::instance().get_qwen3_tts(
+                        body["model"].asString());
+                    if (!qwen3_model) {
+                        model = ModelManager::instance().get_tts(
+                            body["model"].asString());
+                    }
                 }
-                if (!model) {
+                if (!model && !qwen3_model) {
                     callback(error_response(
                         "The requested TTS model is not available. Start the "
                         "server with --txt2wav or provide a valid 'model' field.",
@@ -2014,8 +2028,11 @@ void registerAudioSpeech(drogon::HttpAppFramework& app) {
 
                 std::shared_ptr<ov::Tensor> speaker_embedding;
                 if (!voice.empty()) {
+                    const std::filesystem::path models_dir =
+                        qwen3_model ? qwen3_model->models_path()
+                                    : model->models_path();
                     const std::filesystem::path emb_path =
-                        model->models_path() / "voices" / (voice + ".bin");
+                        models_dir / "voices" / (voice + ".bin");
                     std::ifstream fin(emb_path, std::ios::binary);
                     if (!fin) {
                         throw std::runtime_error(
@@ -2044,13 +2061,22 @@ void registerAudioSpeech(drogon::HttpAppFramework& app) {
                     }
                 }
 
-                pool().enqueue([model, text, response_format,
+                pool().enqueue([model, qwen3_model, text, response_format,
                                 speaker_embedding, callback] {
                     drogon::HttpResponsePtr resp;
                     try {
-                        TTSResult result = model->generate(
-                            text, speaker_embedding ? *speaker_embedding
-                                                    : ov::Tensor{});
+                        TTSResult result;
+                        if (qwen3_model) {
+                            result = qwen3_model->generate(
+                                text,
+                                speaker_embedding ? *speaker_embedding
+                                                  : ov::Tensor{});
+                        } else {
+                            result = model->generate(
+                                text,
+                                speaker_embedding ? *speaker_embedding
+                                                  : ov::Tensor{});
+                        }
                         std::vector<std::uint8_t> raw =
                             wav_pcm16(result.samples, result.sample_rate);
                         resp = bytes_response(
