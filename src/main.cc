@@ -381,6 +381,11 @@ int main(int argc, char** argv) {
     }
 
     ovserver::register_api_handlers(app);
+    // All models are loaded synchronously above, so from here on a successful
+    // startup means the unit is genuinely ready. Listener binding happens
+    // inside app.run(); READY is emitted just before it (the listener binds
+    // within milliseconds, the model load is the long pole).
+    ovserver::notify_systemd_ready();
     app.run();
 
     // Graceful teardown: release the models and shut down OpenVINO plugins

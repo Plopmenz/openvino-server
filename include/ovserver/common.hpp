@@ -56,6 +56,12 @@ void log_model_memory(const std::string& tag,
                       const std::string& id,
                       const std::vector<std::string>& devices);
 
+// Signals readiness to systemd (Type=notify) with the raw sd_notify(3)
+// protocol: sends "READY=1" as a datagram to the $NOTIFY_SOCKET unix socket.
+// No-op when started outside systemd (variable unset). Call once after all
+// models are loaded and the API handlers are registered.
+void notify_systemd_ready();
+
 // Scope guard emitting the shared startup/loaded log lines of every pipeline
 // constructor: "[tag model 'id'] loading from PATH on DEVICE ..." at
 // construction and, on completion(), "[tag model 'id'] loaded in Xs" followed

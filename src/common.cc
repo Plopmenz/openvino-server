@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <iomanip>
@@ -14,6 +17,10 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 #include <json/json.h>
 
@@ -284,6 +291,43 @@ void PipelineLoadLog::completion() {
         devices.push_back(m_second_device);
     }
     log_model_memory(m_tag, m_id, devices);
+}
+
+void notify_systemd_ready() {
+    const char* sock_name = std::getenv("NOTIFY_SOCKET");
+    if (sock_name == nullptr || sock_name[0] == '\0') {
+        // Not started by systemd; run() semantics are unchanged.
+        return;
+    }
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::size_t prefix = 0;
+    if (sock_name[0] == '@') {
+        // Abstract socket namespace: leading NUL inside sun_path.
+        prefix = 1;
+        addr.sun_path[0] = '\0';
+    }
+    const std::size_t len = std::strlen(sock_name) - prefix;
+    if (len >= sizeof(addr.sun_path)) {
+        std::cerr << "warning: NOTIFY_SOCKET too long, skipping READY=1"
+                  << std::endl;
+        return;
+    }
+    std::memcpy(addr.sun_path + (prefix ? 1 : 0), sock_name + prefix, len);
+
+    const socklen_t sun_len =
+        static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                               (prefix ? 1 : 0) + len);
+    const int fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return;
+    }
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sun_len) == 0) {
+        static constexpr char kReady[] = "READY=1\n";
+        (void)::send(fd, kReady, sizeof(kReady) - 1, MSG_NOSIGNAL);
+    }
+    ::close(fd);
 }
 
 }  // namespace ovserver
