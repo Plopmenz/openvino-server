@@ -76,9 +76,9 @@
         src = pkgs.fetchFromGitHub {
           owner = "openvinotoolkit";
           repo = "openvino";
-          rev = "227c33757d1ef95d4da506d00686f923fdd2a535";
+          rev = "cae33e7271d2a066929e6d1e53d7d2a8747c6a8e";
           fetchSubmodules = true;
-          hash = "sha256-Izno1afpXxiqMVrlyDvTHXsnJ9wo0Q63IlEjdKrTzqc=";
+          hash = "sha256-mq/5uIp5CKA5pyHRtI5EJPnKl1ioxG5PzG6woFNjJ3Y=";
         };
         cmakeFlags = (pkgs.lib.remove (pkgs.lib.cmakeBool "ENABLE_ONEDNN_FOR_GPU" false) old.cmakeFlags) ++ [ (pkgs.lib.cmakeBool "ENABLE_ONEDNN_FOR_GPU" true) ];
         postInstall = (old.postInstall or "") + ''
@@ -144,8 +144,8 @@
         src = pkgs.fetchFromGitHub {
           owner = "openvinotoolkit";
           repo = "openvino.genai";
-          rev = "7ea2546852a382cd16bd22dea0cfad2db70ed744";
-          hash = "sha256-sRJbnXF7/CaHx86+dbIDv9FC1GthMW58vstQ4elf16Q=";
+          rev = "3abf349be2c53f911d5de6edc2744e20c1780ba5";
+          hash = "sha256-O+Ub30ZSNbml50gg2ee/J8Lbmj9n1oqjPBvJHef21aM=";
         };
         # Remove stale patch
         patches = [ ];
@@ -180,8 +180,8 @@
         src = pkgs.fetchFromGitHub {
           owner = "openvinotoolkit";
           repo = "openvino_tokenizers";
-          rev = "a04accf6282d9b304214b492694b18c3979f667a";
-          hash = "sha256-M+HPqxwCZCBxSmpcnaIPBtEniRD9H1lCFgOrqH/eAFQ=";
+          rev = "971e835eea677e7cd3eda8ad4e582525846c1df5";
+          hash = "sha256-ZfHzwFSMpR/EJlazoucZnBAA5y3+dqvPI6Oz9PZuGBc=";
         };
         patches = [ ./nix/openvino-tokenizers-use-system-pcre2-and-sentencepiece-binary-dir.patch ];
       });
