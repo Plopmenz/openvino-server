@@ -189,6 +189,10 @@ struct TextGenerationSpec {
     // Device for the speculative-decoding draft model (bundled MTP head).
     // Empty reuses `device`.
     std::string second_device;
+    // KV cache size in GB. 0 keeps the library default, which grows the cache
+    // on demand; a fixed size bounds it so the model cannot crowd out others
+    // sharing the device's memory.
+    std::size_t kv_cache_size_gb = 0;
 };
 
 }  // namespace ovserver

@@ -63,6 +63,10 @@ void usage(const char* argv0) {
         << "                          default). Caching retains previously computed\n"
         << "                          KV blocks for prompt-prefix reuse, improving\n"
         << "                          TTFT at the cost of VRAM.\n"
+        << "      --kv-cache-size GB  Fixed KV cache size in GB for text models.\n"
+        << "                          Default 0 grows the cache on demand, which\n"
+        << "                          can exhaust memory shared with other models\n"
+        << "                          on an integrated GPU.\n"
         << "      --prompt-lookup     Enable prompt-lookup speculative decoding.\n"
         << "                          Uses n-gram matching against the prompt to\n"
         << "                          draft candidate tokens. No extra model needed.\n"
@@ -138,6 +142,7 @@ int main(int argc, char** argv) {
     std::string device_props;
     size_t cache_interval_multiplier = 64;
     bool enable_prefix_caching = true;
+    size_t kv_cache_size_gb = 0;
     bool prompt_lookup = false;
     size_t num_assistant_tokens = 5;
     size_t max_ngram_size = 3;
@@ -201,6 +206,8 @@ int main(int argc, char** argv) {
                     std::stoul(get_arg(argc, argv, i, a.c_str()));
             } else if (a == "--no-prefix-caching") {
                 enable_prefix_caching = false;
+            } else if (a == "--kv-cache-size") {
+                kv_cache_size_gb = std::stoul(get_arg(argc, argv, i, a.c_str()));
             } else if (a == "--prompt-lookup") {
                 prompt_lookup = true;
             } else if (a == "--num-assistant-tokens") {
@@ -355,7 +362,8 @@ int main(int argc, char** argv) {
                      max_ngram_size,
                      enable_mtp,
                      cache_dir,
-                     second_device});
+                     second_device,
+                     kv_cache_size_gb});
             LOG_INFO << "Text model '" << id
                      << "' ready at /v1/chat/completions";
         }
