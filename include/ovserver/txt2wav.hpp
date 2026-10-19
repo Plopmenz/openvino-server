@@ -41,7 +41,8 @@ public:
     const std::filesystem::path& models_path() const { return m_models_path; }
 
     TTSResult generate(const std::string& text,
-                       const ov::Tensor& speaker_embedding = ov::Tensor());
+                       const ov::Tensor& speaker_embedding = ov::Tensor(),
+                       const ov::AnyMap& properties = {});
 
 private:
     std::string m_id;

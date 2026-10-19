@@ -13,7 +13,6 @@
 #include "ovserver/txt2txt.hpp"
 #include "ovserver/txt2wav.hpp"
 #include "ovserver/txt2vid.hpp"
-#include "ovserver/qwen3_tts.hpp"
 
 namespace ovserver {
 
@@ -35,7 +34,6 @@ public:
 
     void load_tts(const std::string& id, const TTSSpec& spec);
     std::shared_ptr<TTSModel> get_tts(const std::string& id) const;
-    std::shared_ptr<Qwen3TTSModel> get_qwen3_tts(const std::string& id) const;
 
     // Releases all loaded models. Called explicitly on shutdown so genai/OV
     // objects are destroyed while the process and OpenVINO plugins are still
@@ -59,9 +57,6 @@ public:
 
     std::unordered_map<std::string, std::shared_ptr<TTSModel>> all_tts() const;
 
-    std::unordered_map<std::string, std::shared_ptr<Qwen3TTSModel>>
-    all_qwen3_tts() const;
-
 private:
     mutable std::mutex m_mutex;
     std::unordered_map<std::string, std::shared_ptr<ImageGenerationModel>>
@@ -72,8 +67,6 @@ private:
         m_video_models;
     std::unordered_map<std::string, std::shared_ptr<ASRModel>> m_asr_models;
     std::unordered_map<std::string, std::shared_ptr<TTSModel>> m_tts_models;
-    std::unordered_map<std::string, std::shared_ptr<Qwen3TTSModel>>
-        m_qwen3_tts_models;
 };
 
 }  // namespace ovserver

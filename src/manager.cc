@@ -60,16 +60,6 @@ std::shared_ptr<TTSModel> ModelManager::get_tts(const std::string& id) const {
     return it->second;
 }
 
-std::shared_ptr<Qwen3TTSModel> ModelManager::get_qwen3_tts(
-    const std::string& id) const {
-    std::lock_guard lock(m_mutex);
-    auto it = m_qwen3_tts_models.find(id);
-    if (it == m_qwen3_tts_models.end()) {
-        return nullptr;
-    }
-    return it->second;
-}
-
 void ModelManager::load_image(const std::string& id,
                               const ImageGenerationSpec& spec) {
     std::lock_guard lock(m_mutex);
@@ -115,19 +105,12 @@ void ModelManager::load_asr(const std::string& id, const ASRSpec& spec) {
 
 void ModelManager::load_tts(const std::string& id, const TTSSpec& spec) {
     std::lock_guard lock(m_mutex);
-    if (m_tts_models.find(id) != m_tts_models.end() ||
-        m_qwen3_tts_models.find(id) != m_qwen3_tts_models.end()) {
+    if (m_tts_models.find(id) != m_tts_models.end()) {
         throw std::runtime_error("tts model '" + id + "' already loaded");
     }
-    if (is_qwen3_tts_layout(spec.path)) {
-        auto model = std::make_shared<Qwen3TTSModel>(id, spec.path, spec.device,
-                                                     spec.cache_dir);
-        m_qwen3_tts_models.emplace(id, std::move(model));
-    } else {
-        auto model = std::make_shared<TTSModel>(id, spec.path, spec.device,
-                                                spec.cache_dir);
-        m_tts_models.emplace(id, std::move(model));
-    }
+    auto model = std::make_shared<TTSModel>(id, spec.path, spec.device,
+                                            spec.cache_dir);
+    m_tts_models.emplace(id, std::move(model));
 }
 
 std::unordered_map<std::string, std::shared_ptr<ImageGenerationModel>>
@@ -160,12 +143,6 @@ ModelManager::all_tts() const {
     return m_tts_models;
 }
 
-std::unordered_map<std::string, std::shared_ptr<Qwen3TTSModel>>
-ModelManager::all_qwen3_tts() const {
-    std::lock_guard lock(m_mutex);
-    return m_qwen3_tts_models;
-}
-
 void ModelManager::shutdown() {
     std::lock_guard lock(m_mutex);
     m_image_models.clear();
@@ -173,7 +150,6 @@ void ModelManager::shutdown() {
     m_video_models.clear();
     m_asr_models.clear();
     m_tts_models.clear();
-    m_qwen3_tts_models.clear();
 }
 
 }  // namespace ovserver

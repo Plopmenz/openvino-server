@@ -34,14 +34,15 @@ TTSModel::TTSModel(const std::string& id,
 TTSModel::~TTSModel() = default;
 
 TTSResult TTSModel::generate(const std::string& text,
-                             const ov::Tensor& speaker_embedding) {
+                             const ov::Tensor& speaker_embedding,
+                             const ov::AnyMap& properties) {
     std::lock_guard<std::mutex> lock(m_mutex);
     const std::uint64_t req_id = m_next_req_id++;
     std::cerr << "[tts model '" << m_id << "'] request " << req_id << " start"
               << std::endl;
     const auto start = std::chrono::steady_clock::now();
     const ov::genai::Text2SpeechDecodedResults result =
-        m_pipeline->generate(text, speaker_embedding);
+        m_pipeline->generate(text, speaker_embedding, properties);
     if (result.speeches.empty())
         throw std::runtime_error("tts: no speech produced");
     const ov::Tensor& speech = result.speeches.front();

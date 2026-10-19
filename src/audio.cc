@@ -114,6 +114,35 @@ std::string ffmpeg_path() {
     return g_ffmpeg_path;
 }
 
+std::vector<float> decode_audio_source_to_f32(const std::string& source,
+                                              int sample_rate) {
+    if (source.empty())
+        return {};
+    const std::filesystem::path out = write_temp_file("", ".f32");
+    TempFileCleanup out_cleanup(out);
+    const bool remote = source.find("://") != std::string::npos;
+    const std::string cmd =
+        shell_quote(ffmpeg_path()) +
+        " -hide_banner -loglevel error -y " +
+        (remote ? "-rw_timeout 30000000 " : "") +
+        "-i " + shell_quote(source) + " -ac 1 -ar " +
+        std::to_string(sample_rate) + " -f f32le " + shell_quote(out.string());
+    const int status = std::system(cmd.c_str());
+    if (status != 0)
+        throw std::runtime_error(
+            "audio decode: ffmpeg failed for source '" + source +
+            "' (is ffmpeg on PATH? is the URL reachable?)");
+    std::ifstream fin(out, std::ios::binary);
+    if (!fin)
+        throw std::runtime_error("audio decode: no decoded output");
+    std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(fin)),
+                                    std::istreambuf_iterator<char>());
+    const std::size_t n = bytes.size() / sizeof(float);
+    std::vector<float> result(n);
+    std::memcpy(result.data(), bytes.data(), n * sizeof(float));
+    return result;
+}
+
 std::vector<float> decode_audio_to_f32(const std::string& data, int sample_rate) {
     if (data.empty())
         return {};

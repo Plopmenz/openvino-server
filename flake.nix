@@ -76,9 +76,9 @@
         src = pkgs.fetchFromGitHub {
           owner = "openvinotoolkit";
           repo = "openvino";
-          rev = "cae33e7271d2a066929e6d1e53d7d2a8747c6a8e";
+          rev = "6d7915298f2db3ae0217eab85f57afe321c758c6";
           fetchSubmodules = true;
-          hash = "sha256-mq/5uIp5CKA5pyHRtI5EJPnKl1ioxG5PzG6woFNjJ3Y=";
+          hash = "sha256-qQUguoQ5fnYawgmuE9kYld9AewEA2/Kmqesa45Fq0SQ=";
         };
         cmakeFlags = (pkgs.lib.remove (pkgs.lib.cmakeBool "ENABLE_ONEDNN_FOR_GPU" false) old.cmakeFlags) ++ [ (pkgs.lib.cmakeBool "ENABLE_ONEDNN_FOR_GPU" true) ];
         postInstall = (old.postInstall or "") + ''
@@ -140,12 +140,12 @@
       # Uses overrideAttrs so the C++ package inherits nixpkgs build flags,
       # with our custom source/rev.
       openvino-genai = (pkgs.openvino-genai.override { inherit openvino openvino-tokenizers; }).overrideAttrs (old: {
-        version = "master-2026-09-01";
+        version = "master-2026-09-17";
         src = pkgs.fetchFromGitHub {
           owner = "openvinotoolkit";
           repo = "openvino.genai";
-          rev = "3abf349be2c53f911d5de6edc2744e20c1780ba5";
-          hash = "sha256-O+Ub30ZSNbml50gg2ee/J8Lbmj9n1oqjPBvJHef21aM=";
+          rev = "40dad80c46bdeeb543c252eb7c54b3c43a1f92e0";
+          hash = "sha256-j9lw8rw3QiRZpcI3ccGd0Hnux5w8TUTnRGlo5eIo7Is=";
         };
         # Remove stale patch
         patches = [ ];
@@ -176,12 +176,12 @@
       # libopenvino.so.2620 and would fail to dlopen at runtime on the 2026.5.0
       # stack. Uses overrideAttrs so the C++ package inherits nixpkgs .python output.
       openvino-tokenizers = (pkgs.openvino-tokenizers.override { inherit openvino; }).overrideAttrs (old: {
-        version = "master-2026-09-01";
+        version = "master-2026-09-17";
         src = pkgs.fetchFromGitHub {
           owner = "openvinotoolkit";
           repo = "openvino_tokenizers";
-          rev = "971e835eea677e7cd3eda8ad4e582525846c1df5";
-          hash = "sha256-ZfHzwFSMpR/EJlazoucZnBAA5y3+dqvPI6Oz9PZuGBc=";
+          rev = "d73028e255ddc279483fbc6e8ea90dc802e820f5";
+          hash = "sha256-YYteGb2buefv3FR5MpK2+PapejC2J6JsB6eqzm6E2KI=";
         };
         patches = [ ./nix/openvino-tokenizers-use-system-pcre2-and-sentencepiece-binary-dir.patch ];
       });

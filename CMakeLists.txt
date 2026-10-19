@@ -28,9 +28,6 @@ add_executable(openvino-server
     src/audio.cc
     src/wav2txt.cc
     src/txt2wav.cc
-    src/qwen3_tts.cc
-    src/qwen3_tts_bpe.cc
-    src/qwen3_tts_tables.cc
     src/base64.cc
     src/model_detect.cc
 )
