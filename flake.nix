@@ -76,11 +76,10 @@
         src = pkgs.fetchFromGitHub {
           owner = "openvinotoolkit";
           repo = "openvino";
-          rev = "6d7915298f2db3ae0217eab85f57afe321c758c6";
+          rev = "fde316cf48b371dd495e2e0ce840056a6f8a8356";
           fetchSubmodules = true;
-          hash = "sha256-qQUguoQ5fnYawgmuE9kYld9AewEA2/Kmqesa45Fq0SQ=";
+          hash = "sha256-Dx6oObRP/f6nLY7ShJwNC+i+G+yu89niSXlXHpIs6zk=";
         };
-        cmakeFlags = (pkgs.lib.remove (pkgs.lib.cmakeBool "ENABLE_ONEDNN_FOR_GPU" false) old.cmakeFlags) ++ [ (pkgs.lib.cmakeBool "ENABLE_ONEDNN_FOR_GPU" true) ];
         postInstall = (old.postInstall or "") + ''
            ln -s ${intel-npu-compiler}/lib/libopenvino_intel_npu_compiler_loader.so \
              ${placeholder "lib"}/lib/openvino/libopenvino_intel_npu_compiler_loader.so
@@ -132,7 +131,7 @@
         substituteInPlace $out/CMakeLists.txt \
           --replace-fail \
             '-Wno-error=free-nonheap-object -flto=auto' \
-            '-Wno-error=free-nonheap-object'
+            '-Wno-error=free-nonheap-object -Wno-error=array-bounds'
       '';
 
       # openvino-genai built from master so that Qwen-Image support is available.
@@ -144,11 +143,9 @@
         src = pkgs.fetchFromGitHub {
           owner = "openvinotoolkit";
           repo = "openvino.genai";
-          rev = "40dad80c46bdeeb543c252eb7c54b3c43a1f92e0";
-          hash = "sha256-j9lw8rw3QiRZpcI3ccGd0Hnux5w8TUTnRGlo5eIo7Is=";
+          rev = "73c4b0db060c39b6e7c3b7bcdc43e3d69c8a5fb3";
+          hash = "sha256-FrXbZm8XpG+6j2Z/UXsn94MmelSzVaGSlJ/Q/ZdneD4=";
         };
-        # Remove stale patch
-        patches = [ ];
         # xgrammar is supplied pre-patched (Python bindings already OFF), so
         # drop openvino-genai's read-only rewrite of the config (comment the
         # file(WRITE) out so nothing is written; the read is harmless).

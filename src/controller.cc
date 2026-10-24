@@ -64,6 +64,45 @@ bool getInt64(const Json::Value& obj, const char* key, int64_t& out) {
     return true;
 }
 
+// Reads an optional string member. Returns false when absent/null; throws when
+// present but not a JSON string.
+bool getOptionalString(const Json::Value& obj, const char* key, std::string& out) {
+    if (!obj.isMember(key) || obj[key].isNull()) {
+        return false;
+    }
+    if (!obj[key].isString()) {
+        throw std::runtime_error(std::string("'") + key + "' must be a string");
+    }
+    out = obj[key].asString();
+    return true;
+}
+
+// Reads an optional numeric member. Returns false when absent/null; throws when
+// present but not a JSON number.
+bool getOptionalDouble(const Json::Value& obj, const char* key, double& out) {
+    if (!obj.isMember(key) || obj[key].isNull()) {
+        return false;
+    }
+    if (!obj[key].isNumeric()) {
+        throw std::runtime_error(std::string("'") + key + "' must be a number");
+    }
+    out = obj[key].asDouble();
+    return true;
+}
+
+// Reads an optional boolean member. Returns false when absent/null; throws when
+// present but not a JSON boolean.
+bool getOptionalBool(const Json::Value& obj, const char* key, bool& out) {
+    if (!obj.isMember(key) || obj[key].isNull()) {
+        return false;
+    }
+    if (!obj[key].isBool()) {
+        throw std::runtime_error(std::string("'") + key + "' must be a boolean");
+    }
+    out = obj[key].asBool();
+    return true;
+}
+
 // Serializes JSON to a compact single-line string (no indentation/comments).
 std::string compact_json(const Json::Value& v) {
     Json::StreamWriterBuilder builder;
@@ -1996,6 +2035,8 @@ void registerAudioSpeech(drogon::HttpAppFramework& app) {
                     return;
                 }
 
+                // OpenAI standard formats. Empirically the server only emits
+                // PCM/WAV natively; other containers would need transcoding.
                 std::string response_format = "wav";
                 if (body.isMember("response_format") &&
                     body["response_format"].isString()) {
@@ -2008,25 +2049,125 @@ void registerAudioSpeech(drogon::HttpAppFramework& app) {
                     return;
                 }
 
+                // 'voice' (OpenAI) and 'speaker' (model convention) are
+                // aliases; a JSON object {"id": "..."} is also accepted.
                 std::string voice;
-                if (body.isMember("voice") && body["voice"].isString()) {
-                    voice = body["voice"].asString();
+                if (body.isMember("voice") && body["voice"].isObject() &&
+                    body["voice"].isMember("id") &&
+                    body["voice"]["id"].isString()) {
+                    voice = body["voice"]["id"].asString();
+                } else {
+                    getOptionalString(body, "voice", voice);
+                }
+                std::string speaker;
+                getOptionalString(body, "speaker", speaker);
+
+                // Qwen3-TTS variant selection. genai auto-detects the actual
+                // variant from the model dir; task_type is validated for
+                // consistency so mismatched requests fail fast with 400.
+                std::string task_type;
+                getOptionalString(body, "task_type", task_type);
+                if (!task_type.empty() && task_type != "Base" &&
+                    task_type != "CustomVoice" && task_type != "VoiceDesign") {
+                    callback(error_response(
+                        "'task_type' must be \"CustomVoice\", \"VoiceDesign\" "
+                        "or \"Base\"",
+                        drogon::k400BadRequest));
+                    return;
                 }
 
-                // Voice-clone reference for Qwen3 Base models. 'task_type' is
-                // accepted for API compatibility but not forwarded: genai
-                // auto-detects the Qwen3 TTS variant from the model dir.
+                std::string language;
+                getOptionalString(body, "language", language);
+
+                // OpenAI 'instructions' maps to Qwen3-TTS 'instruct'; accept
+                // both spellings.
+                std::string instruct;
+                getOptionalString(body, "instructions", instruct);
+                std::string instruct_alias;
+                if (getOptionalString(body, "instruct", instruct_alias) &&
+                    instruct.empty()) {
+                    instruct = instruct_alias;
+                }
+
                 std::string ref_audio;
-                if (body.isMember("ref_audio") && body["ref_audio"].isString()) {
-                    ref_audio = body["ref_audio"].asString();
-                }
+                getOptionalString(body, "ref_audio", ref_audio);
                 std::string ref_text;
-                if (body.isMember("ref_text") && body["ref_text"].isString()) {
-                    ref_text = body["ref_text"].asString();
+                getOptionalString(body, "ref_text", ref_text);
+
+                bool x_vector_only_mode = false;
+                getOptionalBool(body, "x_vector_only_mode",
+                                x_vector_only_mode);
+
+                double speed = 0.0;
+                if (getOptionalDouble(body, "speed", speed) &&
+                    (speed < 0.25 || speed > 4.0)) {
+                    callback(error_response(
+                        "'speed' must be between 0.25 and 4.0",
+                        drogon::k400BadRequest));
+                    return;
                 }
 
+                bool have_sample_rate = false;
+                int64_t sample_rate = 0;
+                if (getInt64(body, "sample_rate", sample_rate) &&
+                    sample_rate <= 0) {
+                    callback(error_response(
+                        "'sample_rate' must be a positive integer",
+                        drogon::k400BadRequest));
+                    return;
+                }
+                have_sample_rate = body.isMember("sample_rate");
+
+                bool have_max_new_tokens = false;
+                int64_t max_new_tokens = 0;
+                if (getInt64(body, "max_new_tokens", max_new_tokens)) {
+                    if (max_new_tokens <= 0) {
+                        callback(error_response(
+                            "'max_new_tokens' must be a positive integer",
+                            drogon::k400BadRequest));
+                        return;
+                    }
+                    have_max_new_tokens = true;
+                }
+                bool have_seed = false;
+                int64_t seed = 0;
+                if (getInt64(body, "seed", seed)) {
+                    have_seed = true;
+                }
+
+                // Pre-computed speaker embedding: calibration-format .bin file
+                // under <model>/voices/<voice>.bin, or an inline vector list
+                // (vllm-omni convention). Inline wins when both are present.
                 std::shared_ptr<ov::Tensor> speaker_embedding;
-                if (!voice.empty()) {
+                if (body.isMember("speaker_embedding") &&
+                    body["speaker_embedding"].isArray() &&
+                    !body["speaker_embedding"].empty()) {
+                    const Json::Value& emb = body["speaker_embedding"];
+                    std::vector<float> values;
+                    values.reserve(emb.size());
+                    for (const auto& v : emb) {
+                        if (v.isNumeric()) {
+                            values.push_back(v.asFloat());
+                        } else if (v.isArray()) {
+                            for (const auto& inner : v) {
+                                if (!inner.isNumeric()) {
+                                    throw std::runtime_error(
+                                        "'speaker_embedding' entries must be "
+                                        "numbers");
+                                }
+                                values.push_back(inner.asFloat());
+                            }
+                        } else {
+                            throw std::runtime_error(
+                                "'speaker_embedding' must be a list of "
+                                "numbers or list of vectors");
+                        }
+                    }
+                    speaker_embedding = std::make_shared<ov::Tensor>(
+                        ov::element::f32, ov::Shape{values.size()});
+                    std::copy(values.begin(), values.end(),
+                              speaker_embedding->data<float>());
+                } else if (!voice.empty()) {
                     const std::filesystem::path emb_path =
                         model->models_path() / "voices" / (voice + ".bin");
                     std::ifstream fin(emb_path, std::ios::binary);
@@ -2059,12 +2200,37 @@ void registerAudioSpeech(drogon::HttpAppFramework& app) {
 
                 pool().enqueue([model, text, response_format,
                                 speaker_embedding, ref_audio, ref_text,
-                                callback] {
+                                instruct, speaker, language, task_type,
+                                x_vector_only_mode, speed, have_sample_rate,
+                                sample_rate, have_max_new_tokens,
+                                max_new_tokens, have_seed, seed, callback] {
                     drogon::HttpResponsePtr resp;
                     try {
                         ov::AnyMap properties;
                         if (!ref_text.empty())
                             properties["ref_text"] = ref_text;
+                        // 'speaker' is a named voice for CustomVoice models;
+                        // 'voice' above is the Base x-vector embedding path.
+                        if (!speaker.empty())
+                            properties["speaker"] = speaker;
+                        if (!instruct.empty())
+                            properties["instruct"] = instruct;
+                        if (!language.empty())
+                            properties["language"] = language;
+                        if (speed > 0.0)
+                            properties["speed"] = static_cast<float>(speed);
+                        if (have_max_new_tokens)
+                            properties["max_new_tokens"] =
+                                static_cast<size_t>(max_new_tokens);
+                        if (have_seed)
+                            properties["rng_seed"] =
+                                static_cast<size_t>(seed);
+                        // ref_audio alone implies x-vector-only mode in genai;
+                        // when only ref_text has no audio there is no voice
+                        // source. An explicit flag is accepted for parity with
+                        // vllm-omni but is otherwise a no-op here.
+                        (void)x_vector_only_mode;
+                        (void)task_type;
                         if (!ref_audio.empty()) {
                             // genai expects an f32 waveform tensor at 24 kHz
                             // and does no fetching/decoding/resampling itself.
@@ -2105,6 +2271,13 @@ void registerAudioSpeech(drogon::HttpAppFramework& app) {
                             response_format == "wav"
                                 ? drogon::CT_AUDIO_WAVE
                                 : drogon::CT_APPLICATION_OCTET_STREAM);
+                        // The pipeline's native rate cannot be overridden via
+                        // generation properties, so advertise it instead of
+                        // silently resampling.
+                        if (have_sample_rate)
+                            resp->addHeader(
+                                "X-Sample-Rate",
+                                std::to_string(result.sample_rate));
                     } catch (const std::exception& e) {
                         resp = error_response(
                             "Failed to generate speech: " +
