@@ -84,6 +84,9 @@ void usage(const char* argv0) {
         << "      --cache-dir PATH    Directory where OpenVINO stores compiled\n"
         << "                          model blobs, reused across restarts to speed\n"
         << "                          up model loading. Disabled when not set.\n"
+        << "      --cache-size GB     Size of the KV cache in gigabytes for text\n"
+        << "                          models. When not set, OpenVINO GenAI chooses\n"
+        << "                          a default based on device memory.\n"
         << "      --temp-dir PATH     Directory for generated artifacts. Videos\n"
         << "                          are stored under PATH/videos using a random\n"
         << "                          UUID as file name, returned to the client as\n"
@@ -144,6 +147,7 @@ int main(int argc, char** argv) {
     bool enable_mtp = true;
     std::string ffmpeg = "ffmpeg";
     std::string cache_dir;
+    size_t cache_size_gb = 0;
     std::string temp_dir;
 
     try {
@@ -176,6 +180,8 @@ int main(int argc, char** argv) {
                 ffmpeg = get_arg(argc, argv, i, a.c_str());
             } else if (a == "--cache-dir") {
                 cache_dir = get_arg(argc, argv, i, a.c_str());
+            } else if (a == "--cache-size") {
+                cache_size_gb = std::stoul(get_arg(argc, argv, i, a.c_str()));
             } else if (a == "--temp-dir") {
                 temp_dir = get_arg(argc, argv, i, a.c_str());
             } else if (a == "-d" || a == "--device") {
@@ -355,7 +361,8 @@ int main(int argc, char** argv) {
                      max_ngram_size,
                      enable_mtp,
                      cache_dir,
-                     second_device});
+                     second_device,
+                     cache_size_gb});
             LOG_INFO << "Text model '" << id
                      << "' ready at /v1/chat/completions";
         }

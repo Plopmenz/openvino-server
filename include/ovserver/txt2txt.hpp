@@ -189,6 +189,8 @@ struct TextGenerationSpec {
     // Device for the speculative-decoding draft model (bundled MTP head).
     // Empty reuses `device`.
     std::string second_device;
+    // Total KV cache size in gigabytes. 0 means use GenAI default.
+    std::size_t cache_size_gb = 0;
 };
 
 }  // namespace ovserver

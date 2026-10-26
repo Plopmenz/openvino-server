@@ -426,6 +426,9 @@ TextGenerationModel::TextGenerationModel(const std::string& id,
     ov::genai::SchedulerConfig sched_cfg;
     sched_cfg.cache_interval_multiplier = spec.cache_interval_multiplier;
     sched_cfg.enable_prefix_caching = spec.enable_prefix_caching;
+    if (spec.cache_size_gb > 0) {
+        sched_cfg.cache_size = static_cast<size_t>(spec.cache_size_gb);
+    }
     try {
         ov::AnyMap props = inference_properties(m_device, spec.cache_dir);
         // Speculative decoding: prompt-lookup drafts candidates by n-gram
