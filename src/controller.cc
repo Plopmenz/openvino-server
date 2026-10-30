@@ -911,27 +911,24 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
 
                                 TextGenerateOptions gen = opts;
                                 auto toolbuf = std::make_shared<std::string>();
-                                auto in_tool = std::make_shared<bool>(false);
-                                // Every <tool_call> block held back from content;
-                                // sent as content at the end if no call parses.
-                                auto withheld = std::make_shared<std::string>();
+                                std::shared_ptr<std::string> in_tool;
                                 const std::string tool_open = "<tool_call>";
                                 const std::string tool_close = "</tool_call>";
                                 gen.on_text =
-                                    [send_delta, toolbuf, in_tool, withheld, tool_open,
-                                     tool_close](std::string word) {
-                                        if (*in_tool) {
+                                    [send_delta, toolbuf, in_tool, tool_open,
+                                     tool_close](std::string word) mutable {
+                                        if (in_tool) {
                                             *toolbuf += word;
                                             const auto c = toolbuf->find(
                                                 tool_close);
                                             if (c == std::string::npos) {
                                                 return true;
                                             }
-                                            withheld->append(toolbuf->substr(
+                                            in_tool->append(toolbuf->substr(
                                                 0, c + tool_close.size()));
                                             toolbuf->erase(0,
                                                            c + tool_close.size());
-                                            *in_tool = false;
+                                            in_tool = nullptr;
                                             if (toolbuf->empty()) {
                                                 return true;
                                             }
@@ -949,9 +946,8 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                                                         return false;
                                                     }
                                                 }
-                                                *in_tool = true;
-                                                toolbuf->clear();
-                                                toolbuf->append(word.substr(o));
+                                                in_tool = std::make_shared<std::string>();
+                                                in_tool->append(word.substr(o));
                                                 return true;
                                             }
                                         }
@@ -973,21 +969,18 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                                 // Sends the trailing finish_reason (+ usage when
                                 // requested) and [DONE], then closes the stream.
                                 auto finish = [state, shared_id, shared_model,
-                                               stream_usage, withheld, toolbuf,
-                                               in_tool](
+                                               stream_usage, in_tool, toolbuf](
                                                   const TextResult& r) {
                                     std::lock_guard lock(state->mutex);
                                     if (!state->stream) {
                                         return;
                                     }
                                     Json::Value delta;
-                                    if (*in_tool) {
-                                        withheld->append(*toolbuf);  // unclosed block
+                                    if (in_tool) {
+                                        in_tool->append(*toolbuf);
                                     }
-                                    if (r.tool_calls.empty() && !withheld->empty()) {
-                                        // Nothing parsed (or the request had no tools):
-                                        // the held-back text is the answer; never drop it.
-                                        delta["content"] = *withheld;
+                                    if (r.tool_calls.empty() && in_tool) {
+                                        delta["content"] = *in_tool;
                                     }
                                     if (!r.tool_calls.empty()) {
                                         // Function calls are only fully known
