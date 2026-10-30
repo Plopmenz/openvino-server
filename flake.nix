@@ -76,10 +76,19 @@
         src = pkgs.fetchFromGitHub {
           owner = "openvinotoolkit";
           repo = "openvino";
-          rev = "fde316cf48b371dd495e2e0ce840056a6f8a8356";
+          rev = "a3562d4a36a6f061e675e2a405b0c28019e3229a";
           fetchSubmodules = true;
-          hash = "sha256-Dx6oObRP/f6nLY7ShJwNC+i+G+yu89niSXlXHpIs6zk=";
+          hash = "sha256-cBTG2hglbAGWe3YALuOtiKSbl/J0c99rHNXG98KCmOs=";
         };
+        # Drop nixpkgs' gcc-16 patch that doesn't match upstream master
+        patches = builtins.filter (p: !(pkgs.lib.hasInfix "gcc-16-fix" (toString p))) (old.patches or [ ]);
+        postPatch = (old.postPatch or "") + ''
+          # fix GCC16 autovec param
+          sed -i '293a\                else()' cmake/developer_package/compile_flags/functions.cmake
+          sed -i '294s/.*/                    list(APPEND ''${flags} -mautovec-preference=asimd-only)/' cmake/developer_package/compile_flags/functions.cmake
+          sed -i '295a\                endif()' cmake/developer_package/compile_flags/functions.cmake
+          sed -i '296s/.*/                    list(APPEND ''${flags} --param=aarch64-autovec-preference=1)/' cmake/developer_package/compile_flags/functions.cmake
+        '';
         postInstall = (old.postInstall or "") + ''
            ln -s ${intel-npu-compiler}/lib/libopenvino_intel_npu_compiler_loader.so \
              ${placeholder "lib"}/lib/openvino/libopenvino_intel_npu_compiler_loader.so
@@ -143,8 +152,8 @@
         src = pkgs.fetchFromGitHub {
           owner = "openvinotoolkit";
           repo = "openvino.genai";
-          rev = "73c4b0db060c39b6e7c3b7bcdc43e3d69c8a5fb3";
-          hash = "sha256-FrXbZm8XpG+6j2Z/UXsn94MmelSzVaGSlJ/Q/ZdneD4=";
+          rev = "7b6ad9096b4c175c7fb1862c7d1a8ff2e70638c6";
+          hash = "sha256-BoyMUr5J5JwroHAg6uRv/0UQanMjseu1lwosxxpnxcQ=";
         };
         # xgrammar is supplied pre-patched (Python bindings already OFF), so
         # drop openvino-genai's read-only rewrite of the config (comment the
