@@ -912,10 +912,13 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                                 TextGenerateOptions gen = opts;
                                 auto toolbuf = std::make_shared<std::string>();
                                 auto in_tool = std::make_shared<bool>(false);
+                                // Every <tool_call> block held back from content;
+                                // sent as content at the end if no call parses.
+                                auto withheld = std::make_shared<std::string>();
                                 const std::string tool_open = "<tool_call>";
                                 const std::string tool_close = "</tool_call>";
                                 gen.on_text =
-                                    [send_delta, toolbuf, in_tool, tool_open,
+                                    [send_delta, toolbuf, in_tool, withheld, tool_open,
                                      tool_close](std::string word) {
                                         if (*in_tool) {
                                             *toolbuf += word;
@@ -924,6 +927,8 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                                             if (c == std::string::npos) {
                                                 return true;
                                             }
+                                            withheld->append(toolbuf->substr(
+                                                0, c + tool_close.size()));
                                             toolbuf->erase(0,
                                                            c + tool_close.size());
                                             *in_tool = false;
@@ -968,13 +973,22 @@ void registerChatCompletions(drogon::HttpAppFramework& app) {
                                 // Sends the trailing finish_reason (+ usage when
                                 // requested) and [DONE], then closes the stream.
                                 auto finish = [state, shared_id, shared_model,
-                                               stream_usage](
+                                               stream_usage, withheld, toolbuf,
+                                               in_tool](
                                                   const TextResult& r) {
                                     std::lock_guard lock(state->mutex);
                                     if (!state->stream) {
                                         return;
                                     }
                                     Json::Value delta;
+                                    if (*in_tool) {
+                                        withheld->append(*toolbuf);  // unclosed block
+                                    }
+                                    if (r.tool_calls.empty() && !withheld->empty()) {
+                                        // Nothing parsed (or the request had no tools):
+                                        // the held-back text is the answer; never drop it.
+                                        delta["content"] = *withheld;
+                                    }
                                     if (!r.tool_calls.empty()) {
                                         // Function calls are only fully known
                                         // once generation ends, so they arrive

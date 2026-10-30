@@ -100,6 +100,7 @@ public:
                     return false;
                 }
                 m_in_reasoning = !m_in_reasoning;
+                m_skip_ws = !m_in_reasoning;  // content after the marker: drop its leading newlines
                 buf.erase(0, idx + tag.size());
                 continue;
             }
@@ -136,6 +137,14 @@ private:
         if (m_in_reasoning) {
             return on_reasoning(text);
         }
+        if (m_skip_ws) {
+            const std::size_t s = text.find_first_not_of(" \t\r\n");
+            if (s == std::string::npos) {
+                return true;  // still only whitespace; keep skipping
+            }
+            m_skip_ws = false;
+            return on_text(text.substr(s));
+        }
         return on_text(text);
     }
 
@@ -143,6 +152,7 @@ private:
     std::string m_close_tag;
     bool m_in_reasoning;
     std::string m_pending;
+    bool m_skip_ws = false;
 };
 
 // Finds the JSON object starting at `start` (a balanced brace scan that ignores
@@ -350,10 +360,13 @@ std::vector<ToolCall> extract_tool_calls(const std::string& text) {
                 text.find(close_marker, open_at);
             const std::size_t stop =
                 (close_at != std::string::npos) ? close_at : text.size();
-            // Prefer the XML <function=...> form (Qwen3.6 / Hermes).
+            // Prefer the XML <function=...> form (Qwen3.6 / Hermes). The call must
+            // start inside this block; comparing the JSON-escaped arguments' length
+            // with the raw block rejected any value with enough quotes/newlines
+            // (an HTML page of ~2k chars), and the call was then dropped.
+            const std::size_t fn_at = text.find("<function=", open_at);
             if (const auto xml = parse_xml_tool_call(text, open_at);
-                xml && xml->name.size() + xml->arguments.size() <=
-                           stop - open_at) {
+                xml && fn_at < stop) {
                 ToolCall call = *xml;
                 call.id = "call_" + std::to_string(idx++);
                 calls.push_back(std::move(call));
@@ -534,7 +547,11 @@ void TextGenerationModel::detect_parsers() {
         m_reasoning = ReasoningMarkers{/*enabled=*/true,
                                        /*expect_open_tag=*/false,
                                        /*open_tag=*/"",
-                                       /*close_tag=*/"\n</think>\n\n"};
+                                       // The tag alone: before a tool call Qwen
+                                       // writes "</think>\n<tool_call>", which
+                                       // never matched "\n</think>\n\n", so the
+                                       // calls stayed in reasoning_content.
+                                       /*close_tag=*/"</think>"};
     }
 
     // --- Tool calling -------------------------------------------------------
